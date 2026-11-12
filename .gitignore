@@ -1,3 +1,7 @@
-proto/out/
+app/target/
+build/
 *.jpg
+proto/out/
 __pycache__/
+third_party/src/
+third_party/wimlib-win64/
