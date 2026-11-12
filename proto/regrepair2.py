@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Prototype v2: repair a registry hive in memory and write it compactly.
+
+Order:
+  1. (caller) replay transaction logs with hivelog.py
+  2. undelete intact keys from free cells (with class names + security descriptors)
+  3. restore lost state databases from the WIM (SOFTWARE)
+  4. add keys/values missing compared to the WIM (X: -> C:)
+  5. write a fresh compact hive (hivecompact.write_tree)
+
+Usage: regrepair2.py WIM_HIVE VM_HIVE OUT [--vm-files SHA1LIST] [--report FILE]
+"""
+import argparse
+import re
+
+from hivecompact import load_tree, write_tree
+from hiveundelete import FreeCells, classes_from_logs
+from regdiff import fix_drive, fix_name, is_state, DRIVE
+
+STATE_LOSS = 0.5
+RESTORABLE_STATE = (
+    r"\microsoft\windows\currentversion\sidebyside",
+    r"\microsoft\windows\currentversion\component based servicing",
+    r"\microsoft\windows\currentversion\appx\appxalluserstore",
+    r"\microsoft\windows\currentversion\capabilityaccessmanager\capabilities",
+)
+CBS_PACKAGES = r"\microsoft\windows\currentversion\component based servicing\packages"
+
+
+def new_key(name, like):
+    """Empty key with metadata (sd, class, flags...) taken from `like`."""
+    return {"name": name, "flags": like["flags"] & ~0x2C, "ts": like["ts"],
+            "access": like["access"], "class": like["class"], "sd": like["sd"],
+            "values": [], "subs": {}, "restored": True}
+
+
+def count(k):
+    return 1 + sum(count(c) for c in k["subs"].values())
+
+
+def get(k, path):
+    for part in [p for p in path.split("\\") if p]:
+        k = k["subs"].get(part.lower())
+        if k is None:
+            return None
+    return k
+
+
+class Repair:
+    def __init__(self, vm, wim, log):
+        self.vm, self.wim, self.log = vm, wim, log
+        self.cs_map = {}
+        if get(wim, "Select") is not None:
+            def current(root):
+                for n, t, d in get(root, "Select")["values"]:
+                    if n.lower() == "current":
+                        return "ControlSet%03d" % int.from_bytes(d[:4], "little")
+            self.cs_map = {current(vm): current(wim)}
+
+    # -- 2. undelete ------------------------------------------------------------
+    def undelete(self, deleted):
+        """Windows clears the security pointer of deleted keys, so the descriptor comes
+        from the same key in the WIM, or else from the parent (what inheritance gives)."""
+        for low in sorted(deleted, key=lambda k: k.count("\\")):
+            path, vals, _, (cls, sd, flags, access, ts) = deleted[low]
+            parts = [p for p in path.split("\\") if p]
+            parent = get(self.vm, "\\".join(parts[:-1]))
+            if parent is None:
+                continue
+            existing = parent["subs"].get(parts[-1].lower())
+            if existing is not None:
+                if existing.get("from_wim"):
+                    # created from the WIM in this run: the machine's own copy wins
+                    existing["values"] = list(vals) + [
+                        v for v in existing["values"]
+                        if v[0].lower() not in {x[0].lower() for x in vals}]
+                    if cls:
+                        existing["class"] = cls
+                    existing["from_wim"] = False
+                    self.log.append(("undeleted over wim", path, "class" if cls else ""))
+                continue
+            if sd is None:
+                wk = get(self.wim, self.wim_path(path))
+                sd = wk["sd"] if wk else parent["sd"]
+            parent["subs"][parts[-1].lower()] = {
+                "name": parts[-1], "flags": flags & ~0x2C, "ts": ts, "access": access,
+                "class": cls, "sd": sd, "values": list(vals), "subs": {}, "restored": True}
+            self.log.append(("undeleted", path, "class" if cls else ""))
+
+    def wim_path(self, path):
+        """VM path -> WIM path (control set numbers may differ)."""
+        if self.cs_map:
+            low = path.lower().lstrip("\\")
+            for vcs, wcs in self.cs_map.items():
+                if low.startswith(vcs.lower()):
+                    return wcs + path.lstrip("\\")[len(vcs):]
+        return path
+
+    # -- 3. lost state databases ---------------------------------------------------
+    def restore_lost_state(self, installed_mums):
+        for sk in RESTORABLE_STATE:
+            w = get(self.wim, sk)
+            if w is None:
+                continue
+            v = get(self.vm, sk)
+            if v is not None and count(v) > count(w) * (1 - STATE_LOSS):
+                continue
+            print(f"state area lost ({count(v) if v else 0}/{count(w)} keys): {sk}")
+            if v is None:
+                parts = [p for p in sk.split("\\") if p]
+                parent = get(self.vm, "\\".join(parts[:-1]))
+                if parent is None:
+                    continue
+                v = parent["subs"][parts[-1].lower()] = new_key(w["name"], w)
+                self.log.append(("key", sk, ""))
+            self.copy_into(w, v, sk, state_ok=True, installed_mums=installed_mums)
+
+    # -- 4. WIM merge -------------------------------------------------------------
+    def copy_values(self, w, v, path, state_ok=False):
+        have = {fix_name(n).lower() for n, _, _ in v["values"]}
+        for name, t, data in w["values"]:
+            n = fix_name(name)
+            if n.lower() in have or (not state_ok and is_state(path, n)):
+                continue
+            v["values"].append((n, t, fix_drive(t, data, DRIVE)))
+            self.log.append(("value", path, n))
+
+    def copy_into(self, w, v, path, state_ok=False, installed_mums=None):
+        """Add everything from WIM key w missing in VM key v (recursive)."""
+        if not state_ok and is_state(path):
+            return
+        self.copy_values(w, v, path, state_ok)
+        for low, wc in w["subs"].items():
+            sub = path + "\\" + wc["name"]
+            if (path.lower() == CBS_PACKAGES and installed_mums is not None
+                    and low not in installed_mums):
+                self.log.append(("skipped removed package", sub, ""))
+                continue
+            if not state_ok and is_state(sub):
+                continue
+            vc = v["subs"].get(low)
+            if vc is None:
+                vc = v["subs"][low] = new_key(wc["name"], wc)
+                vc["from_wim"] = True
+                self.log.append(("key", sub, ""))
+            self.copy_into(wc, vc, sub, state_ok, installed_mums)
+
+    def merge(self):
+        sel = get(self.wim, "Select")
+        if sel is not None:            # SYSTEM: map the current control set on both sides
+            def current(root):
+                for n, t, d in get(root, "Select")["values"]:
+                    if n.lower() == "current":
+                        return "ControlSet%03d" % int.from_bytes(d[:4], "little")
+            wcs, vcs = current(self.wim), current(self.vm)
+            self.copy_into(get(self.wim, wcs), get(self.vm, vcs), "CurrentControlSet")
+            for low, wc in self.wim["subs"].items():
+                if low.startswith("controlset"):
+                    continue
+                vc = self.vm["subs"].get(low)
+                if vc is None:
+                    if is_state(wc["name"]):
+                        continue
+                    vc = self.vm["subs"][low] = new_key(wc["name"], wc)
+                    self.log.append(("key", wc["name"], ""))
+                self.copy_into(wc, vc, wc["name"])
+        else:
+            self.copy_into(self.wim, self.vm, "")
+
+
+CONFIGFLAG_REINSTALL = 0x20
+
+
+def flag_reinstall(vm, rep, log):
+    """Mark devices whose Control\\Class driver key is missing for reinstall. PnP then
+    reinstalls the driver and recreates the class/interface keys itself."""
+    cs = get(vm, list(rep.cs_map)[0])
+    classes = get(cs, "Control\\Class")
+    n = 0
+
+    def walk(k, path, depth):
+        nonlocal n
+        if depth == 3:
+            vals = {v[0].lower(): v for v in k["values"]}
+            if "driver" not in vals:
+                return
+            drv = vals["driver"][2].decode("utf-16-le", "replace").rstrip("\0")
+            guid, _, inst = drv.partition("\\")
+            c = classes["subs"].get(guid.lower()) if classes else None
+            if c is not None and inst.lower() in c["subs"]:
+                return
+            old = int.from_bytes(vals["configflags"][2][:4], "little") if "configflags" in vals else 0
+            k["values"] = [v for v in k["values"] if v[0].lower() != "configflags"] + [
+                ("ConfigFlags", 4, (old | CONFIGFLAG_REINSTALL).to_bytes(4, "little"))]
+            log.append(("pnp reinstall", path, drv))
+            n += 1
+            return
+        for c in k["subs"].values():
+            walk(c, path + "\\" + c["name"], depth + 1)
+    walk(get(cs, "Enum"), "Enum", 0)
+    return n
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("wim")
+    ap.add_argument("vm")
+    ap.add_argument("out")
+    ap.add_argument("--vm-files", help="sha1 list of \\Windows (installed CBS .mum files)")
+    ap.add_argument("--report")
+    ap.add_argument("--logs", nargs="*", default=[],
+                    help="original .LOG1/.LOG2 (old key records -> class names)")
+    a = ap.parse_args()
+
+    vm, base = load_tree(a.vm)
+    wim, _ = load_tree(a.wim)
+    log = []
+    rep = Repair(vm, wim, log)
+
+    fc = FreeCells(a.vm)
+    deleted = fc.deleted_keys()
+    rep.undelete(deleted)
+    print(f"undeleted: {sum(1 for x in log if x[0] == 'undeleted')} keys "
+          f"({sum(1 for x in log if x[0] == 'undeleted' and x[2])} with class names)")
+    if get(wim, "Select") is None:
+        mums = None
+        if a.vm_files:
+            mums = set()
+            for line in open(a.vm_files, encoding="utf-8", errors="surrogateescape"):
+                m = re.search(r"\./servicing/Packages/(.+)\.mum$", line.rstrip("\n"), re.I)
+                if m:
+                    mums.add(m.group(1).lower())
+        rep.restore_lost_state(mums)
+    rep.merge()
+    before = sum(1 for x in log if x[0] == "undeleted")
+    rep.undelete(deleted)       # 2nd pass: parents that only came back from the WIM
+    print(f"undeleted after WIM merge: {sum(1 for x in log if x[0] == 'undeleted') - before}")
+    print(f"from WIM: {sum(1 for x in log if x[0] == 'key')} keys, "
+          f"{sum(1 for x in log if x[0] == 'value')} values")
+    # devices whose driver key is gone: let PnP reinstall them on next boot
+    if get(wim, "Select") is not None:
+        n = flag_reinstall(vm, rep, log)
+        if n:
+            print(f"devices marked for PnP reinstall: {n}")
+
+    # class names for restored keys that came back without one (e.g. Lsa boot key)
+    for path, cls in classes_from_logs(fc, a.logs).items():
+        k = get(vm, path)
+        if k is not None and k.get("restored") and k["class"] != cls:
+            k["class"] = cls
+            log.append(("class from log", path, cls.decode("utf-16-le", "replace")))
+            print(f"class name from log: {path} = {cls.decode('utf-16-le', 'replace')}")
+    n, s = write_tree(vm, base, a.out)
+    print(f"wrote {n} keys, {s} security descriptors")
+    if a.report:
+        with open(a.report, "w", encoding="utf-8") as f:
+            for kind, p, x in log:
+                f.write(f"{kind}\t{p}\t{x}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -120,5 +120,60 @@ class FreeCells:
             ts = struct.unpack_from("<Q", self.d, c + 8)[0]
             prev = out.get(p.lower())
             if prev is None or ts > prev[2]:   # keep newest copy of the same key
-                out[p.lower()] = (p, vals, ts)
+                out[p.lower()] = (p, vals, ts, self.meta(c))
         return out
+
+    def meta(self, c):
+        """(class bytes|None, security descriptor|None, flags, access, timestamp bytes)."""
+        d = self.d
+        flags, access = struct.unpack_from("<H", d, c + 6)[0], self.u32(c + 16)
+        skoff, cloff = self.u32(c + 4 + 44), self.u32(c + 4 + 48)
+        cllen = struct.unpack_from("<H", d, c + 4 + 74)[0]
+        cls = None
+        if cllen and cloff != 0xFFFFFFFF:
+            cc = self.cell(cloff)
+            if cc and len(cc[0]) >= cllen:
+                cls = cc[0][:cllen]
+        sd = None
+        sk = self.cell(skoff)
+        if sk and sk[0][:2] == b"sk":
+            n = struct.unpack_from("<I", sk[0], 16)[0]
+            if 20 + n <= len(sk[0]):
+                sd = sk[0][20:20 + n]
+        return cls, sd, flags, access, d[c + 8:c + 16]
+
+
+def classes_from_logs(fc, log_paths):
+    """Class names of keys, recovered from stale nk records in transaction logs.
+
+    Logs keep old page images. An old nk record still knows its parent and the offset of
+    its class-name cell; that cell often survives as a free cell in the hive.
+    Returns {path_lower: class_bytes}."""
+    import re
+    out = {}
+    for lp in log_paths:
+        try:
+            L = open(lp, "rb").read()
+        except FileNotFoundError:
+            continue
+        for m in re.finditer(b"nk", L):
+            nk = m.start()
+            if nk + 76 > len(L):
+                break
+            nlen, cllen = struct.unpack_from("<HH", L, nk + 72)
+            if not cllen or not 0 < nlen < 256 or nk + 76 + nlen > len(L):
+                continue
+            flags = struct.unpack_from("<H", L, nk + 2)[0]
+            raw = L[nk + 76:nk + 76 + nlen]
+            try:
+                name = raw.decode("ascii") if flags & 0x20 else raw.decode("utf-16-le")
+            except UnicodeDecodeError:
+                continue
+            parent = fc.path(struct.unpack_from("<I", L, nk + 16)[0])
+            if parent is None:
+                continue
+            cell = fc.cell(struct.unpack_from("<I", L, nk + 48)[0])
+            if not cell or len(cell[0]) < cllen:
+                continue
+            out[(parent + "\\" + name).lower()] = cell[0][:cllen]
+    return out
