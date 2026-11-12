@@ -67,3 +67,53 @@ The WIM `DEFAULT` hive is only 32 KiB. Setup builds the real one, so it's a weak
 
 Next: break the VM on purpose (scenarios 1–4) and check the breakage stands out from
 this baseline.
+
+## 2026-11-12 — First blind repair: "boots, never reaches desktop"
+
+The user broke the VM without telling what they did. Symptom: boots, never reaches the
+desktop, an empty error dialog.
+
+### Diagnosis (read-only, ~1 min)
+
+- **573 files deleted** from `System32` / `SysWOW64` (beyond the baseline):
+  `Microsoft-Edge-WebView` (169), `SysWOW64\wbem` (67), 32-bit PowerShell modules,
+  `Keywords`, ~50 `SysWOW64\<lang>` folders, `vulkan-1.dll`, `opencl.dll`, `msclmd.dll`,
+  perf counters, `OEMDefaultAssociations.*`, … and all of `System32\Tasks`.
+- No file content changed, only deletions.
+- Registry base hives: no new missing keys. **SOFTWARE was dirty** (seq 824/823). Log
+  replay with `regipy` produced 12 unreadable nodes and a wrong header checksum → not
+  trustworthy. Need our own replay (or WinPE, where Windows replays natively).
+- `System32\Tasks` contents aren't in the WIM (setup generates them), can't restore from WIM.
+
+### Restore rules that worked (`proto/plan.py`)
+
+No baseline needed: a healthy VM gets **0 actions**, the broken VM gets **exactly the 573
+deleted files**, nothing else.
+
+1. WinSxS file, whole component folder gone → removed on purpose, skip.
+2. `servicing\Packages\X.mum/.cat`, package key `X` gone from CBS → skip.
+3. Known moves (`System32\Recovery\Winre.wim` → `\Recovery\WindowsRE\`) → skip.
+4. File has hardlink twins in WinSxS: the component (= WinSxS folder name = key under
+   `COMPONENTS\DerivedData\Components`) must have an owner (`c!…` value). No owner →
+   staged, not installed (e.g. WMIC in 25H2) → skip.
+5. Twin present on disk → **re-create the hardlink** (content + ACL come with it).
+6. No twin → extract from WIM, set ACL from the WIM security descriptor.
+
+Gotcha: `wimlib-imagex dir --detailed` gives unlinked files a dummy link group; only
+`Link Count > 1` means a real hardlink.
+
+Result: 531 hardlinks, 42 extracted files, 107 folders (with ACLs).
+
+### Applying from Linux
+
+- Mount with **ntfs-3g** (not the kernel `ntfs3` driver) to get `system.ntfs_acl`
+  (full self-relative security descriptor) via `setfattr`.
+- The volume was **dirty** (NTFS journal not replayed, Windows was cut off). ntfs-3g
+  falls back to read-only silently. Used `ntfsfix -d` (empties the journal, risky, user's
+  choice). → WinPE is the safer target: Windows replays `$LogFile` itself.
+- `guestfish debug sh` doesn't keep quoting → upload a real shell script into the guest
+  and run it in the appliance (`proto/plan.py` emits `plan.apply.sh`, idempotent).
+- Applying 573 files: ~1 s.
+
+Verified: missing-file list identical to the healthy baseline, hardlink counts restored,
+ACLs equal to WIM.

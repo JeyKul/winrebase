@@ -50,13 +50,18 @@ DRIVE = "C:"
 
 def walk(wh, wn, vh, vn, path, res):
     """wn exists in WIM; vn is the matching VM node (exists)."""
-    wv, vv = values(wh, wn), values(vh, vn)
+    wv = values(wh, wn)
+    try:
+        vv = values(vh, vn)
+        vc = children(vh, vn)
+    except RuntimeError as e:
+        res["corrupt"].append((path, str(e)))
+        return
     for k, (name, t, data) in wv.items():
         if k not in vv:
             res["missing_value"].append((path, name))
         elif vv[k][1:] != (t, fix_drive(t, data, DRIVE)):
             res["changed_value"].append((path, name))
-    vc = children(vh, vn)
     for k, wc in children(wh, wn).items():
         sub = path + "\\" + wh.node_name(wc)
         if k in vc:
@@ -78,7 +83,7 @@ def main():
     a = ap.parse_args()
 
     wh, vh = hivex.Hivex(a.wim), hivex.Hivex(a.vm)
-    res = {"missing_key": [], "missing_value": [], "changed_value": []}
+    res = {"missing_key": [], "missing_value": [], "changed_value": [], "corrupt": []}
 
     wcs, vcs = current_controlset(wh), current_controlset(vh)
     if wcs:
