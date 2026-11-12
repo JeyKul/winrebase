@@ -22,6 +22,59 @@ def fix_drive(t, data, drive):
     return data
 
 
+def fix_name(name, drive="C:"):
+    if name[:2].lower() == "x:":
+        return drive + name[2:]
+    return name
+
+
+# Subtrees/values Windows owns as runtime or setup state. Differences here are expected
+# after install and are never repaired from the WIM. Lowercase, paths as printed by walk().
+STATE_KEYS = (
+    # SOFTWARE
+    r"\microsoft\windows nt\currentversion\schedule\taskcache",
+    r"\microsoft\windows\currentversion\appx\appxalluserstore",
+    r"\microsoft\windows nt\currentversion\print\packagestoadd",
+    r"\microsoft\windows nt\currentversion\print\offlineprinters",
+    r"\microsoft\windows\currentversion\component based servicing",
+    r"\microsoft\windows\currentversion\sidebyside",
+    r"\microsoft\windowsupdate\orchestrator",
+    r"\microsoft\windows\currentversion\capabilityaccessmanager\capabilities",
+    r"\microsoft\windows\currentversion\runonce",
+    r"\microsoft\windows nt\currentversion\systemrestore\setup",
+    r"\microsoft\provisioning\reloadsforced",
+    r"\microsoft\policymanager\providers",
+    r"\wow6432node\microsoft\edgeupdate",
+    r"\microsoft\wbem\cimom",
+    r"\microsoft\msdtc\security",
+    r"\classes\cid", r"\classes\cid.local", r"\classes\svcid", r"\classes\svcid.local",
+    r"\wow6432node\microsoft\windows\currentversion\shareddlls",
+    # SYSTEM
+    r"currentcontrolset\control\wmi\autologger",
+    r"currentcontrolset\control\networksetup2",
+    r"currentcontrolset\control\ci\ngen",
+    r"currentcontrolset\services\clfs\authentication",
+    r"currentcontrolset\services\nlasvc\parameters\internet\manualproxies",
+    r"currentcontrolset\control\class\{6d807884-7d21-11cf-801c-08002be10318}\properties",
+    r"setup",
+)
+STATE_VALUES = {
+    (r"currentcontrolset\control\session manager", "setupexecute"),
+    (r"currentcontrolset\control\pnp", "disablelkg"),
+    (r"currentcontrolset\services\i8042prt\parameters", "layerdriver jpn"),
+    (r"currentcontrolset\services\i8042prt\parameters", "layerdriver kor"),
+    (r"\microsoft\windows nt\currentversion\fontlink", "updatefontlinks"),
+    (r"\wow6432node\microsoft\windows\currentversion\uninstall\microsoft edge", "noremove"),
+}
+
+
+def is_state(path, value=None):
+    p = path.lower()
+    if any(p == k or p.startswith(k + "\\") for k in STATE_KEYS):
+        return True
+    return value is not None and (p, value.lower()) in STATE_VALUES
+
+
 def current_controlset(h):
     """Return 'ControlSet00N' for a SYSTEM hive, or None for other hives."""
     sel = h.node_get_child(h.root(), "Select")
@@ -37,11 +90,12 @@ def children(h, node):
     return {h.node_name(c).lower(): c for c in h.node_children(node)}
 
 
-def values(h, node):
+def values(h, node, fixnames=False):
     out = {}
     for v in h.node_values(node):
         t, data = h.value_value(v)
-        out[h.value_key(v).lower()] = (h.value_key(v), t, data)
+        name = fix_name(h.value_key(v)) if fixnames else h.value_key(v)
+        out[name.lower()] = (h.value_key(v), t, data)
     return out
 
 
@@ -50,7 +104,9 @@ DRIVE = "C:"
 
 def walk(wh, wn, vh, vn, path, res):
     """wn exists in WIM; vn is the matching VM node (exists)."""
-    wv = values(wh, wn)
+    if is_state(path):
+        return
+    wv = values(wh, wn, fixnames=True)
     try:
         vv = values(vh, vn)
         vc = children(vh, vn)
@@ -58,6 +114,8 @@ def walk(wh, wn, vh, vn, path, res):
         res["corrupt"].append((path, str(e)))
         return
     for k, (name, t, data) in wv.items():
+        if is_state(path, k):
+            continue
         if k not in vv:
             res["missing_value"].append((path, name))
         elif vv[k][1:] != (t, fix_drive(t, data, DRIVE)):
@@ -66,7 +124,7 @@ def walk(wh, wn, vh, vn, path, res):
         sub = path + "\\" + wh.node_name(wc)
         if k in vc:
             walk(wh, wc, vh, vc[k], sub, res)
-        else:
+        elif not is_state(sub):
             res["missing_key"].append((sub, count_subtree(wh, wc)))
 
 
@@ -100,7 +158,7 @@ def main():
             name = wh.node_name(wc)
             if k in vtop:
                 walk(wh, wc, vh, vtop[k], name, res)
-            else:
+            elif not is_state(name):
                 res["missing_key"].append((name, count_subtree(wh, wc)))
     else:
         walk(wh, wh.root(), vh, vh.root(), "", res)
