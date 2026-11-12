@@ -1,0 +1,11 @@
+[package]
+name = "regtool"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Host-side test driver for winrebase's registry repair (same code as the WinPE app)"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
