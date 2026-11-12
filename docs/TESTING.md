@@ -1,20 +1,36 @@
 # Testing
 
-No broken PC needed. Break a VM on purpose, repair it, check it, roll back, repeat.
+No broken PC needed. Break a VM on purpose, repair it, check it, repeat.
+
+No snapshots: real customer PCs arrive already broken, without a backup. The tool has to
+work from that state, and its own rollback set is the only safety net.
 
 ## Setup
 
-- KVM/QEMU (virt-manager) with UEFI (OVMF) + TPM (swtpm) for Windows 11.
-- Install Windows from a UUP dump ISO of a known build.
-- Let it update to a known UBR, then build a second ISO of that exact UBR → the "clean WIM".
-- Snapshot the VM: `clean`.
+- libvirt VM `win11-2`: UEFI Secure Boot (OVMF), hardware TPM passthrough, qcow2 disk.
+- Install ISO: `Win11_25H2_German_x64.iso` → `install.wim`, build **26200.6584**, 10 editions.
+- Clean WIM = the install ISO as long as the VM stays at 26200.6584. Once the VM updates,
+  build a matching ISO (UUP dump) for the new UBR.
+- Disk access from the host while the VM is **shut off**: `qemu-nbd` (read-only for analysis).
 - Test the tool from both:
   - a WinPE ISO attached as CD
   - a Linux live ISO attached as CD
 
-## Breakage scenarios
+## Reset between tests
 
-Each scenario starts from the `clean` snapshot.
+No snapshot, so if a repair fails:
+
+1. Boot it if possible → run `setup.exe` from the ISO → "keep files and apps"
+   (manual in-place upgrade).
+2. If it doesn't boot anymore: reinstall from the ISO.
+
+That's also the baseline the tool is compared against: it should fix what an in-place
+upgrade fixes, faster, offline, and on PCs that don't boot.
+
+Note: with TPM passthrough, Windows 11 may turn on device encryption (BitLocker) by itself.
+Check `manage-bde -status`, and keep the recovery key. Offline access needs it.
+
+## Breakage scenarios
 
 | # | Scenario | How to break it | Expected after repair |
 |---|----------|-----------------|-----------------------|
