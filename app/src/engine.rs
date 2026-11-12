@@ -381,7 +381,16 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
         .and_then(|k| k.string("SystemRoot")).and_then(|s| s.get(..2).map(|x| x.to_uppercase()))
         .unwrap_or_else(|| "C:".into());
     let profiles = find_profiles(root, &drive, out);
+    let (r2, d2) = (root.to_string(), drive.clone());
+    let exists = std::sync::Arc::new(move |p: &str| {
+        // "C:\Program Files\…" as the installation sees it -> this drive
+        match p.get(..2) {
+            Some(d) if d.eq_ignore_ascii_case(&d2) => win::exists(&format!("{}{}", r2, p[2..].trim_start_matches('\\'))),
+            _ => true,
+        }
+    });
     let opts = reg::Options {
+        exists: Some(exists),
         profiles,
         drive,
         installed_mums: installed_mums(root),
@@ -429,6 +438,7 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
             if r.devices_reinstall > 0 { item.summary.push(format!("{} devices reinstalled on next boot", r.devices_reinstall)); }
             if r.device_reset { item.summary.push("clean device start: Windows detects all hardware again".into()); }
             if r.classes_from_logs > 0 { item.summary.push(format!("{} class names recovered (Lsa boot key)", r.classes_from_logs)); }
+            if r.appx_entries > 0 { item.summary.push(format!("{} per-user app registrations rebuilt", r.appx_entries)); }
             if r.profiles_fixed > 0 { item.summary.push(format!("{} user profile entries repaired", r.profiles_fixed)); }
             if let Some(n) = &r.computer_name { item.summary.push(format!("computer name restored: {n}")); }
         }

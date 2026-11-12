@@ -181,6 +181,8 @@ pub struct Options {
     pub device_reset: DeviceReset,
     /// user profile folders on the disk (SOFTWARE: ProfileList rule)
     pub profiles: Vec<Profile>,
+    /// does this path (as the installation sees it, "C:\…") exist on the disk?
+    pub exists: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
 #[derive(Default, Debug)]
@@ -197,6 +199,7 @@ pub struct Report {
     pub device_reset: bool,
     pub classes_from_logs: usize,
     pub profiles_fixed: usize,
+    pub appx_entries: usize,
     pub computer_name: Option<String>,
 }
 
@@ -205,7 +208,7 @@ impl Report {
         self.undeleted + self.keys_from_wim + self.values_from_wim + self.lost_state.len()
             + self.hw_profile.is_some() as usize + self.driver_keys_rebuilt + self.devices_reinstall
             + self.device_reset as usize + self.classes_from_logs + self.profiles_fixed
-            + self.computer_name.is_some() as usize
+            + self.computer_name.is_some() as usize + self.appx_entries
     }
     fn add(&mut self, kind: &str, path: &str, detail: &str) {
         self.log.push((kind.into(), path.into(), detail.into()));
@@ -574,6 +577,57 @@ fn fix_profiles(vm: &mut Key, profiles: &[Profile], rep: &mut Report) {
     }
 }
 
+const APPX_STORE: &str = r"Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore";
+
+/// Per-user AppX bookkeeping: AppxAllUserStore\<SID>\<package> exists for every inbox
+/// (InboxApplications) and provisioned (Applications) package the user has. When a big part
+/// of a user's list is gone, Start menu, Settings and other apps stop working ("Die Anwendung
+/// wurde nicht bereitgestellt"). Rebuilt from the source keys; only on clear damage, so a
+/// package the user removed on purpose doesn't come back.
+fn fix_appx_users(vm: &mut Key, opts: &Options, rep: &mut Report) {
+    let Some(store) = vm.get_mut(APPX_STORE) else { return };
+    let mut sources: Vec<Key> = Vec::new();
+    for s in ["inboxapplications", "applications"] {
+        if let Some(k) = store.subs.get(s) {
+            sources.extend(k.subs.values().cloned());
+        }
+    }
+    let deprovisioned: HashSet<String> = store.subs.get("deprovisioned")
+        .map(|k| k.subs.keys().cloned().collect()).unwrap_or_default();
+    // packages are named <Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>; deprovisioned by family
+    let family = |n: &str| {
+        let p: Vec<&str> = n.split('_').collect();
+        if p.len() >= 5 { format!("{}_{}", p[0], p[p.len() - 1]) } else { n.to_string() }
+    };
+    let deprov_families: HashSet<String> = deprovisioned.iter().map(|d| family(d)).collect();
+    for (low, user) in store.subs.iter_mut() {
+        if !(low.starts_with("s-1-5-21-") || low.starts_with("s-1-12-")) {
+            continue;
+        }
+        let expected: Vec<&Key> = sources.iter()
+            .filter(|k| !deprov_families.contains(&family(&lower(&k.name)))).collect();
+        let missing: Vec<&Key> = expected.iter().copied().filter(|k| !user.subs.contains_key(&lower(&k.name))).collect();
+        if missing.len() < 5 || missing.len() * 10 < expected.len() {
+            continue;
+        }
+        for src in missing {
+            if let (Some(ex), Some(p)) = (&opts.exists, src.string("Path")) {
+                if !ex(&p) {
+                    rep.add("appx user entry skipped, package files gone", &user.name.clone(), &src.name);
+                    continue;
+                }
+            }
+            let mut k = src.clone();
+            k.restored = true;
+            k.set_value("LastReturnValue", 4, 0u32.to_le_bytes().to_vec());
+            k.set_value("NumberOfAttempts", 4, 1u32.to_le_bytes().to_vec());
+            user.subs.insert(lower(&k.name), k);
+            rep.appx_entries += 1;
+            rep.add("appx user entry rebuilt", &user.name.clone(), &src.name);
+        }
+    }
+}
+
 /// ComputerName restored from the WIM is its placeholder; the real name survives as the
 /// TCP/IP host name.
 fn fix_computer_name(cs: &mut Key, wim_cs: Option<&Key>, rep: &mut Report) {
@@ -689,6 +743,7 @@ pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &O
 
     if !system {
         fix_profiles(vm, &opts.profiles, &mut r.rep);
+        fix_appx_users(vm, opts, &mut r.rep);
     }
     if let Some((vcs, wcs)) = r.cs_map.clone() {
         if let Some(cs) = vm.get_mut(&vcs) {

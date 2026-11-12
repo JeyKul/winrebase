@@ -105,7 +105,7 @@ mod tests {
     fn healthy_hive_needs_nothing() {
         let t = sample();
         let (bytes, _, _) = hive::write(&t, &base());
-        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![] };
+        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![], exists: None };
         let o = process(&bytes, &[], Some(&bytes), &opts).unwrap();
         assert_eq!(o.report.unwrap().actions(), 0);
         assert!(o.output.is_none());
@@ -118,7 +118,7 @@ mod tests {
         vm.get_mut("Software").unwrap().subs.remove("k42");
         let (wb, _, _) = hive::write(&wim, &base());
         let (vb, _, _) = hive::write(&vm, &base());
-        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![] };
+        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![], exists: None };
         let o = process(&vb, &[], Some(&wb), &opts).unwrap();
         assert_eq!(o.report.unwrap().keys_from_wim, 1);
         let out = o.output.unwrap();

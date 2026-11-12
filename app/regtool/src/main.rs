@@ -11,6 +11,7 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let (mut wim, mut logs, mut mums, mut reset) = (None, Vec::new(), None, reg::DeviceReset::Auto);
     let mut profiles = Vec::new();
+    let mut exists: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>> = None;
     let mut pos = Vec::new();
     let mut i = 0;
     while i < a.len() {
@@ -35,6 +36,13 @@ fn main() {
                 println!("profile {} = {}", p[0], reg::repair::sid_string(&sid));
                 profiles.push(reg::Profile { path: p[0].into(), sid, created: p.get(2).and_then(|x| x.parse().ok()).unwrap_or(0) });
             }
+            "--paths" => {
+                // file list of the installation (e.g. guestfish find), "C:\..." checked against it
+                i += 1;
+                let set: HashSet<String> = std::fs::read_to_string(&a[i]).expect("paths").lines()
+                    .map(|l| l.trim_start_matches('/').replace('/', "\\").to_lowercase()).collect();
+                exists = Some(std::sync::Arc::new(move |p: &str| set.contains(&p.get(3..).unwrap_or("").to_lowercase())));
+            }
             "--devreset" => {
                 i += 1;
                 reset = match a[i].as_str() { "always" => reg::DeviceReset::Always, "never" => reg::DeviceReset::Never, _ => reg::DeviceReset::Auto };
@@ -45,7 +53,7 @@ fn main() {
     }
     let primary = std::fs::read(&pos[0]).expect("hive");
     let lr: Vec<&[u8]> = logs.iter().map(|l| l.as_slice()).collect();
-    let opts = reg::Options { drive: "C:".into(), installed_mums: mums, device_reset: reset, profiles };
+    let opts = reg::Options { drive: "C:".into(), installed_mums: mums, device_reset: reset, profiles, exists };
     let t = std::time::Instant::now();
     let o = reg::process(&primary, &lr, wim.as_deref(), &opts).expect("process");
     println!("replay: {}", o.replay.describe());
@@ -56,7 +64,7 @@ fn main() {
         println!("undeleted {}, from WIM {} keys / {} values, lost state {:?}, hw profile {:?}, driver keys {}, reinstall {}, device reset {}, classes from logs {}",
                  r.undeleted, r.keys_from_wim, r.values_from_wim, r.lost_state, r.hw_profile,
                  r.driver_keys_rebuilt, r.devices_reinstall, r.device_reset, r.classes_from_logs);
-        println!("profiles fixed {}, computer name {:?}", r.profiles_fixed, r.computer_name);
+        println!("profiles fixed {}, computer name {:?}, appx entries {}", r.profiles_fixed, r.computer_name, r.appx_entries);
         if let Some(rep) = pos.get(2) {
             let s: String = r.log.iter().map(|(k, p, d)| format!("{k}\t{p}\t{d}\n")).collect();
             std::fs::write(rep, s).unwrap();
