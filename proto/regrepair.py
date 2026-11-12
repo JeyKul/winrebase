@@ -10,8 +10,41 @@ import argparse
 
 import hivex
 
+from hiveundelete import FreeCells
 from regdiff import (children, current_controlset, fix_drive, fix_name, is_state, values,
                      DRIVE)
+
+
+# hivex writes big values as one plain cell; bigdata.py converts them to db records
+MAX_PLAIN_VALUE = 1 << 30   # big values are fixed up afterwards by bigdata.py
+
+
+def set_value(vh, vn, name, t, data, path, log):
+    if len(data) > MAX_PLAIN_VALUE:
+        log.append(("skipped big value", path, name))
+        return
+    vh.node_set_value(vn, {"key": name, "t": t, "value": data})
+    log.append(("value", path, name))
+
+
+def undelete(vh, src_hive, log):
+    """Re-create keys that were deleted but still sit intact in free cells of the same
+    hive (parents first). Only keys that don't exist any more are touched."""
+    deleted = FreeCells(src_hive).deleted_keys()
+    for low in sorted(deleted, key=lambda k: k.count("\\")):
+        path, vals, _ = deleted[low]
+        parts = path.strip("\\").split("\\")
+        node = vh.root()
+        for part in parts[:-1]:
+            node = vh.node_get_child(node, part)
+            if not node:
+                break
+        if not node or vh.node_get_child(node, parts[-1]):
+            continue
+        vn = vh.node_add_child(node, parts[-1])
+        log.append(("undeleted key", path, None))
+        for name, t, data in vals:
+            set_value(vh, vn, name, t, data, path, log)
 
 
 def copy_values(wh, wn, vh, vn, path, log, only_missing):
@@ -19,8 +52,7 @@ def copy_values(wh, wn, vh, vn, path, log, only_missing):
     for k, (name, t, data) in values(wh, wn, fixnames=True).items():
         if is_state(path, k) or k in have:
             continue
-        vh.node_set_value(vn, {"key": fix_name(name), "t": t, "value": fix_drive(t, data, DRIVE)})
-        log.append(("value", path, fix_name(name)))
+        set_value(vh, vn, fix_name(name), t, fix_drive(t, data, DRIVE), path, log)
 
 
 def copy_subtree(wh, wn, vh, vparent, name, path, log):
@@ -58,11 +90,15 @@ def main():
     ap.add_argument("vm")
     ap.add_argument("out")
     ap.add_argument("--report", default=None)
+    ap.add_argument("--no-undelete", action="store_true")
     a = ap.parse_args()
 
     wh = hivex.Hivex(a.wim)
     vh = hivex.Hivex(a.vm, write=True)
     log, changed = [], []
+    if not a.no_undelete:
+        undelete(vh, a.vm, log)
+        print(f"undeleted keys from free cells: {sum(1 for x in log if x[0] == 'undeleted key')}")
 
     wcs, vcs = current_controlset(wh), current_controlset(vh)
     if wcs:
@@ -81,6 +117,9 @@ def main():
     else:
         merge(wh, wh.root(), vh, vh.root(), "", log, changed)
 
+    for x in log:
+        if x[0] == "skipped big value":
+            print(f"  ! skipped value > {MAX_PLAIN_VALUE} bytes: {x[1]} : {x[2]}")
     keys = [x for x in log if x[0] == "key"]
     vals = [x for x in log if x[0] == "value"]
     print(f"added keys: {len(keys)}, added values (incl. in new keys): {len(vals)}, "
@@ -100,6 +139,10 @@ def main():
                 f.write(f"changed (kept)\t{p}\t{n}\n")
     if log:
         vh.commit(a.out)
+        import bigdata
+        n = bigdata.fix(a.out)
+        if n:
+            print(f"converted {n} big value(s) to db records")
     else:
         print("nothing to do")
 
