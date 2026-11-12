@@ -222,3 +222,45 @@ CRITICAL_PROCESS_DIED` right after the boot spinner.
 
 Result vs. healthy state (measured only, not used): 264 018 / 265 029 keys. The rest is
 runtime state (LogonUI notifications, DiagTrack, consent store) Windows recreates.
+
+## 2026-11-12 — ✅ SYSTEM blind test: boots again
+
+User deleted ~3 156 keys in SYSTEM (incl. `Control\Lsa\{JD,Skew1,GBG,Data}`, ACPI, AppID,
+CrashControl, per-user service templates). Symptom: instant blue screen before the spinner.
+
+Also found: the previous SOFTWARE repair had grown the hive to **1.4 GB** (hivex appends a
+new bin for almost every added key). SYSTEM would have gone 11 MB → 312 MB, which the boot
+loader can't load.
+
+### New pieces
+
+- **`proto/hivecompact.py`**: loads a hive into memory and writes a fresh compact hive
+  (sorted lh lists + ri index, lh hashes, deduplicated sk list, class names, flags, access
+  bits, timestamps, big data as full-size 16 344-byte segments like Windows). Verified
+  content-identical on SYSTEM and SOFTWARE (264 588 keys). SOFTWARE 1.4 GB → 76 MB.
+- **`proto/regrepair2.py`**: whole repair in memory, written by the compactor. No hivex
+  writes any more.
+- Deleted keys have their security pointer cleared by Windows (`0xFFFFFFFF`) → descriptor
+  comes from the WIM key, else the parent (= inheritance).
+- **Boot key recovery**: the Lsa class names (boot key → SAM) were gone with the keys.
+  - Skew1: from a free nk record.
+  - JD/GBG/Data: their class-name cells survived as free cells; *stale nk records in
+    `SYSTEM.LOG1`* still pointed at them → exact mapping, no guessing.
+  - All four identical to pre-break (checked afterwards).
+  - Rule: old nk records in transaction logs supply class names for restored keys.
+- **PnP reinstall**: devices whose `Control\Class\{guid}\NNNN` driver key is gone get
+  `ConfigFlags |= CONFIGFLAG_REINSTALL (0x20)`; PnP rebuilds class/interface keys. 14
+  devices (incl. `ROOT\volmgr`, TPM).
+
+Result: boots without problems. 778 hardware-generated keys (Class instances,
+DeviceClasses, Power, NSI) were left to Windows/PnP to recreate.
+
+## Summary of the three blind tests
+
+| Test | Broken | Repaired from | Result |
+|---|---|---|---|
+| Files | all deletable files in System32 + SysWOW64 | WIM (hardlinks to WinSxS + extraction), WIM ACLs, empty dirs | boots |
+| SOFTWARE | keys incl. SxS Winners, CBS, Appx, CapAuthz | logs, free cells, lost-state DBs from WIM, WIM merge | boots |
+| SYSTEM | keys incl. Lsa boot key, ACPI, Class | logs, free cells, stale log records (boot key), WIM, PnP reinstall | boots |
+
+No backup was used for any repair. The healthy install gets zero actions.
