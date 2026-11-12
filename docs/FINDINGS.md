@@ -151,3 +151,26 @@ The deletions also hit machine-generated files, which no WIM contains:
 
 Lesson: the tool also needs a "machine state" inventory: files that aren't in the WIM but
 must exist (DPAPI keys, Tasks, …), reported as **unrecoverable / rebuildable**.
+
+## 2026-11-12 — ✅ It boots
+
+The missing piece was **empty directories**. The planner only created folders that needed
+files, so 92 WIM directories stayed gone, including `System32\GroupPolicy` /
+`GroupPolicyUsers` (→ `gpsvc` failure), `SysWOW64\config\{Journal,RegBack,TxR}`,
+`SysWOW64\LogFiles\{LSA,SAM}`, `sru`, `SMI\Store`, `wbem\Repository`, `Tasks` skeleton.
+76 restored with WIM ACLs (16 belonged to a removed WinSxS component → skipped).
+After that the VM **booted straight to the desktop**.
+
+Full repair for "deleted everything deletable in System32 and SysWOW64":
+
+1. 573 files: 531 hardlinks to WinSxS + 42 extracted (with WIM security descriptors)
+2. 76 + 107 directories (with WIM security descriptors)
+3. no registry changes needed (verified with own log replay)
+4. `ntfsfix -d` twice to get read-write (dirty volume) — WinPE would avoid this
+
+Not restored (not in any WIM): SYSTEM DPAPI master keys, Task XMLs, AppLocker cache,
+`PerfStringBackup.INI`, WinBio DB. Windows booted anyway.
+
+Also learned: `servicing\Sessions\Sessions.xml` is **WOF-compressed** (reparse tag
+`0x80000017`). ntfs-3g without the `system-compression` plugin shows it as a broken
+symlink → hash lists miss it. Need the plugin on Linux, or handle WOF on both backends.
