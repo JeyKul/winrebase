@@ -47,10 +47,10 @@ def undelete(vh, src_hive, log):
             set_value(vh, vn, name, t, data, path, log)
 
 
-def copy_values(wh, wn, vh, vn, path, log, only_missing):
+def copy_values(wh, wn, vh, vn, path, log, only_missing, state_ok=False):
     have = values(vh, vn) if only_missing else {}
     for k, (name, t, data) in values(wh, wn, fixnames=True).items():
-        if is_state(path, k) or k in have:
+        if (not state_ok and is_state(path, k)) or k in have:
             continue
         set_value(vh, vn, fix_name(name), t, fix_drive(t, data, DRIVE), path, log)
 
@@ -64,6 +64,63 @@ def copy_subtree(wh, wn, vh, vparent, name, path, log):
         sub = path + "\\" + cname
         if not is_state(sub):
             copy_subtree(wh, wc, vh, vn, cname, sub, log)
+
+
+# State areas are skipped by the normal diff (their small differences are expected).
+# If an area is (almost) completely gone, it was damaged, not maintained: restore it
+# from the WIM. Fraction of WIM keys that must be missing to trigger this:
+STATE_LOSS = 0.5
+# Only databases are restored. Queues Windows consumes and empties on its own
+# (RunOnce, Print\PackagesToAdd, ...) are legitimately empty on a healthy system.
+RESTORABLE_STATE = (
+    r"\microsoft\windows\currentversion\sidebyside",
+    r"\microsoft\windows\currentversion\component based servicing",
+    r"\microsoft\windows\currentversion\appx\appxalluserstore",
+    r"\microsoft\windows\currentversion\capabilityaccessmanager\capabilities",
+)
+CBS_PACKAGES = r"\microsoft\windows\currentversion\component based servicing\packages"
+
+
+def count(h, n):
+    return 1 + sum(count(h, c) for c in h.node_children(n))
+
+
+def restore_lost_state(wh, vh, log, installed_mums):
+    for sk in RESTORABLE_STATE:
+        parts = sk.strip("\\").split("\\")
+        wn, vn, vparent = wh.root(), vh.root(), None
+        for part in parts:
+            wn = wn and wh.node_get_child(wn, part)
+            vparent, vn = vn, vn and vh.node_get_child(vn, part)
+        if not wn:
+            continue
+        wcount = count(wh, wn)
+        vcount = count(vh, vn) if vn else 0
+        if vcount > wcount * (1 - STATE_LOSS):
+            continue
+        print(f"state area lost ({vcount}/{wcount} keys): {sk} -> restoring from WIM")
+        if vn is None:
+            if vparent is None:
+                continue
+            vn = vh.node_add_child(vparent, wh.node_name(wn))
+            log.append(("key", sk, None))
+        restore_into(wh, wn, vh, vn, sk, log, installed_mums)
+
+
+def restore_into(wh, wn, vh, vn, path, log, installed_mums):
+    copy_values(wh, wn, vh, vn, path, log, only_missing=True, state_ok=True)
+    have = children(vh, vn)
+    for k, wc in children(wh, wn).items():
+        sub = path + "\\" + wh.node_name(wc)
+        if path.lower() == CBS_PACKAGES and installed_mums is not None and k not in installed_mums:
+            log.append(("skipped removed package", sub, None))
+            continue
+        if k in have:
+            restore_into(wh, wc, vh, have[k], sub, log, installed_mums)
+        else:
+            nn = vh.node_add_child(vn, wh.node_name(wc))
+            log.append(("key", sub, None))
+            restore_into(wh, wc, vh, nn, sub, log, installed_mums)
 
 
 def merge(wh, wn, vh, vn, path, log, changed):
@@ -91,6 +148,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--report", default=None)
     ap.add_argument("--no-undelete", action="store_true")
+    ap.add_argument("--vm-files", help="sha1 list of \\Windows (to know installed CBS .mum files)")
     a = ap.parse_args()
 
     wh = hivex.Hivex(a.wim)
@@ -99,6 +157,17 @@ def main():
     if not a.no_undelete:
         undelete(vh, a.vm, log)
         print(f"undeleted keys from free cells: {sum(1 for x in log if x[0] == 'undeleted key')}")
+
+    installed_mums = None
+    if a.vm_files:
+        import re
+        installed_mums = set()
+        for line in open(a.vm_files, encoding="utf-8", errors="surrogateescape"):
+            m = re.search(r"\./servicing/Packages/(.+)\.mum$", line.rstrip("\n"), re.I)
+            if m:
+                installed_mums.add(m.group(1).lower())
+    if not current_controlset(wh):
+        restore_lost_state(wh, vh, log, installed_mums)
 
     wcs, vcs = current_controlset(wh), current_controlset(vh)
     if wcs:
