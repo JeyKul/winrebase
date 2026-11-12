@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # releases on tags
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+          rustup default stable
+
+      - name: Cache wimlib
+        id: wimlib
+        uses: actions/cache@v4
+        with:
+          path: third_party/wimlib-win64
+          key: wimlib-1.14.5-${{ hashFiles('tools/build-wimlib.sh') }}
+
+      - name: Build wimlib (static MinGW)
+        if: steps.wimlib.outputs.cache-hit != 'true'
+        run: tools/build-wimlib.sh
+
+      - name: Registry code on the host (tests + regtool)
+        working-directory: app/regtool
+        run: |
+          cargo test --release --target x86_64-unknown-linux-gnu
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: winrebase.exe
+        working-directory: app
+        run: cargo build --release
+
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp app/target/x86_64-pc-windows-gnu/release/winrebase.exe dist/
+          cp app/regtool/target/x86_64-unknown-linux-gnu/release/regtool dist/regtool-linux-x86_64
+          cp tools/build-iso.sh dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winrebase-${{ github.sha }}
+          path: dist/
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "winrebase $GITHUB_REF_NAME" --notes "$(cat <<'NOTES'
+          **winrebase.exe** — the WinPE repair app (x64). Build a bootable ISO with it from your
+          own Windows ISO: `build-iso.sh Win11_xxx.iso` (needs wimlib-imagex, 7z, xorriso; see
+          README). The ISO itself isn't published: it contains Microsoft files.
+
+          **regtool-linux-x86_64** — the same registry repair code as a Linux CLI, for testing
+          against copied hives.
+
+          ⚠️ Rewrites system files and registry hives. Make a disk backup first. Use a WIM/ESD of
+          exactly the installed build (build + UBR + edition).
+          NOTES
+          )"

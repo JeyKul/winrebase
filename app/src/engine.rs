@@ -334,6 +334,26 @@ pub struct RegItem {
     pub changes: bool,
 }
 
+/// Profile folders with a user hive, and the account each belongs to.
+fn find_profiles(root: &str, drive: &str, out: &mut Out) -> Vec<reg::Profile> {
+    let mut v = Vec::new();
+    let Ok(rd) = std::fs::read_dir(format!("{root}Users")) else { return v };
+    for e in rd.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let Ok(d) = std::fs::read(e.path().join("NTUSER.DAT")) else { continue };
+        let Some(sid) = reg::repair::user_hive_sid(&d) else { continue };
+        let created = meta.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(u64::MAX);
+        out.log(format!("  profile {name}: {}", reg::repair::sid_string(&sid)));
+        v.push(reg::Profile { path: format!("{drive}\\Users\\{name}"), sid, created });
+    }
+    v
+}
+
 fn installed_mums(root: &str) -> Option<HashSet<String>> {
     let rd = std::fs::read_dir(format!("{root}Windows\\servicing\\Packages")).ok()?;
     Some(rd.flatten().filter_map(|e| {
@@ -360,7 +380,9 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
     let drive = read_key(&format!("{cfg}SOFTWARE"), r"Microsoft\Windows NT\CurrentVersion")
         .and_then(|k| k.string("SystemRoot")).and_then(|s| s.get(..2).map(|x| x.to_uppercase()))
         .unwrap_or_else(|| "C:".into());
+    let profiles = find_profiles(root, &drive, out);
     let opts = reg::Options {
+        profiles,
         drive,
         installed_mums: installed_mums(root),
         device_reset: if device_reset { reg::DeviceReset::Always } else { reg::DeviceReset::Auto },
@@ -407,6 +429,8 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
             if r.devices_reinstall > 0 { item.summary.push(format!("{} devices reinstalled on next boot", r.devices_reinstall)); }
             if r.device_reset { item.summary.push("clean device start: Windows detects all hardware again".into()); }
             if r.classes_from_logs > 0 { item.summary.push(format!("{} class names recovered (Lsa boot key)", r.classes_from_logs)); }
+            if r.profiles_fixed > 0 { item.summary.push(format!("{} user profile entries repaired", r.profiles_fixed)); }
+            if let Some(n) = &r.computer_name { item.summary.push(format!("computer name restored: {n}")); }
         }
         item.changes = o.output.is_some();
         if apply {

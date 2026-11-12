@@ -9,7 +9,7 @@ set -eu
 SRC=${1:?usage: build-iso.sh <Windows .iso or mounted ISO dir> [output.iso]}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${2:-$ROOT/build/winrebase-pe.iso}
-EXE=$ROOT/app/target/x86_64-pc-windows-gnu/release/winrebase.exe
+EXE=${EXE:-$ROOT/app/target/x86_64-pc-windows-gnu/release/winrebase.exe}   # or EXE=path/to/winrebase.exe
 WORK=$ROOT/build/iso
 [ -f "$EXE" ] || { echo "build the exe first: (cd app && cargo build --release)"; exit 1; }
 
