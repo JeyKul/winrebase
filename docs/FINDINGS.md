@@ -117,3 +117,37 @@ Result: 531 hardlinks, 42 extracted files, 107 folders (with ACLs).
 
 Verified: missing-file list identical to the healthy baseline, hardlink counts restored,
 ACLs equal to WIM.
+
+## 2026-11-12 — After file repair: still no desktop
+
+Boot after restoring the 573 files: services start, then no desktop.
+
+- Event realtime buffers (`System32\LogFiles\WMI\RtBackup\EtwRTEventLog-*.etl`) are the only
+  logs written when the system never settles; `.evtx` weren't flushed.
+  - SCM: `gpsvc` (0xC0000002), `CoreMessagingRegistrar`, `TimeBrokerSvc`, `AppIDSvc`,
+    `BDESVC`, `NcbService`, `DsmSvc` fail with error 31.
+  - Hard error popup = **`dwm.exe - Systemfehler`** (the "empty error message").
+  - Application log: ~169k events in 3 min, loop around AppContainer profile of
+    `microsoft.windows.fontdrvhost` (`profext\appcontainer.cpp` line 1863).
+- Hives still dirty after the boot (Windows replays logs in memory, never flushed).
+- **Own log replay `proto/hivelog.py`** (HvLE entries, Marvin32 checks): works, hivex
+  opens the result, 0 corrupt nodes (regipy's output had 12). → registry identical to the
+  healthy baseline. The user didn't touch the registry.
+- Whole-volume diff (Program Files, ProgramData, Users) vs WIM: nothing relevant missing
+  (WindowsApps deprovisioned by Windows, ClipSVC install stubs consumed at first boot).
+
+### What the WIM can't restore
+
+The deletions also hit machine-generated files, which no WIM contains:
+
+| Deleted | What | Recoverable |
+|---|---|---|
+| `System32\Microsoft\Protect\S-1-5-18\*` | DPAPI master keys of SYSTEM | no (unique per install) |
+| `System32\Tasks\*` | scheduled task XMLs | rebuild from `TaskCache` registry |
+| `System32\AppLocker\*` | AppLocker cache | regenerated |
+| `System32\PerfStringBackup.INI` | perf counter backup | `lodctr /R` |
+| `System32\WinBioDatabase\*.DAT` | biometrics | re-enroll |
+| `SysWOW64\PrintConfig.dll` | copy from DriverStore | from DriverStore |
+
+Lesson: the tool also needs a "machine state" inventory: files that aren't in the WIM but
+must exist (DPAPI keys, Tasks, …), reported as **unrecoverable / rebuildable**.
