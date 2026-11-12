@@ -92,6 +92,7 @@ def main():
     ap.add_argument("vm_software")
     ap.add_argument("vm_components")
     ap.add_argument("--vm-volume-files", help="optional sha1 list of whole volume (for moves)")
+    ap.add_argument("--vm-dirs", help="find0 output of /Windows (NUL-separated dirs+files)")
     ap.add_argument("--stage", required=True, help="host dir with files extracted from WIM")
     ap.add_argument("--out", default="plan")
     a = ap.parse_args()
@@ -150,6 +151,19 @@ def main():
         while d and d.lower() not in vm_dirs:
             need_dirs.add(d)
             d = os.path.dirname(d)
+
+    # Directories from the WIM that are gone, even if empty (e.g. System32\GroupPolicy).
+    if a.vm_dirs:
+        names = open(a.vm_dirs, "rb").read().split(b"\0")
+        present = {n.decode("utf-8", "surrogateescape").lstrip("./").lower() for n in names if n}
+        for k, e in wim.items():
+            if not e["attrs"] & ATTR_DIRECTORY or k in present or excluded(k + "/"):
+                continue
+            parts = k.split("/")
+            if parts[0] == "winsxs" and len(parts) >= 2 and parts[1] not in vm_sxs_dirs:
+                skipped["dir of removed WinSxS component"] += 1
+                continue
+            need_dirs.add(e["rel"])
 
     print(f"restore actions: {len(actions)}")
     print(f"  link    : {sum(1 for x in actions if x[0] == 'link')}")
