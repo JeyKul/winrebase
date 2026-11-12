@@ -5,3 +5,4 @@ proto/out/
 __pycache__/
 third_party/src/
 third_party/wimlib-win64/
+app/regtool/target/
