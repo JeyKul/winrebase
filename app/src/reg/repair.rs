@@ -35,6 +35,7 @@ const STATE_KEYS: &[&str] = &[
     r"\microsoft\msdtc\security",
     r"\classes\cid", r"\classes\cid.local", r"\classes\svcid", r"\classes\svcid.local",
     r"\wow6432node\microsoft\windows\currentversion\shareddlls",
+    r"\wow6432node\microsoft\windows\currentversion\uninstall\microsoft edge update", // EdgeUpdate removes it
     // SYSTEM
     r"currentcontrolset\control\wmi\autologger",
     r"currentcontrolset\control\networksetup2",
@@ -52,6 +53,7 @@ const STATE_VALUES: &[(&str, &str)] = &[
     (r"currentcontrolset\services\i8042prt\parameters", "layerdriver kor"),
     (r"\microsoft\windows nt\currentversion\fontlink", "updatefontlinks"),
     (r"\wow6432node\microsoft\windows\currentversion\uninstall\microsoft edge", "noremove"),
+    (r"\microsoft\windows nt\currentversion\image file execution options\microsoftedgeupdate.exe", "disableexceptionchainvalidation"),
 ];
 
 /// State databases that are restored from the WIM when more than half of them is gone.
@@ -76,7 +78,12 @@ fn is_state(path: &str, value: Option<&str>) -> bool {
     if STATE_KEYS.iter().any(|k| p == *k || p.starts_with(&format!("{k}\\"))) {
         return true;
     }
-    value.map(|v| STATE_VALUES.iter().any(|(k, n)| p == *k && lower(v) == *n)).unwrap_or(false)
+    value.map(|v| {
+        let v = lower(v);
+        STATE_VALUES.iter().any(|(k, n)| p == *k && v == *n)
+            // perflib rewrites counter blocks of registered providers itself
+            || (v == "counterblock" && p.starts_with(r"\microsoft\windows nt\currentversion\perflib\_v2providers\"))
+    }).unwrap_or(false)
 }
 
 /// WIM hives use X: as the system drive placeholder; Setup rewrites it.
@@ -121,12 +128,59 @@ pub enum DeviceReset {
     Never,
 }
 
+/// A user profile folder found on the disk.
+#[derive(Clone, Debug)]
+pub struct Profile {
+    /// "C:\Users\admin" as the installation sees it
+    pub path: String,
+    /// binary SID of the account, from the SDs inside its NTUSER.DAT
+    pub sid: Vec<u8>,
+    /// folder creation time (any monotonic unit), oldest = original profile
+    pub created: u64,
+}
+
+pub fn sid_string(b: &[u8]) -> String {
+    if b.len() < 8 {
+        return String::new();
+    }
+    let auth = b[2..8].iter().fold(0u64, |a, &x| (a << 8) | x as u64);
+    let n = b[1] as usize;
+    let subs: Vec<String> = (0..n).filter_map(|i| b.get(8 + 4 * i..12 + 4 * i))
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()).to_string()).collect();
+    format!("S-{}-{auth}-{}", b[0], subs.join("-"))
+}
+
+/// The account SID of a user hive: the most frequent user SID (S-1-5-21-…-RID ≥ 1000 or
+/// Entra ID S-1-12-1-…) in its security descriptors.
+pub fn user_hive_sid(d: &[u8]) -> Option<Vec<u8>> {
+    let mut count: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut i = 0;
+    while i + 12 <= d.len() {
+        let n = d[i + 1] as usize;
+        let ok = d[i] == 1 && ((n == 5 && d[i + 2..i + 8] == [0, 0, 0, 0, 0, 5] && d[i + 8..i + 12] == [21, 0, 0, 0])
+                               || (n == 5 && d[i + 2..i + 8] == [0, 0, 0, 0, 0, 12] && d[i + 8..i + 12] == [1, 0, 0, 0]));
+        if ok && i + 8 + 4 * n <= d.len() {
+            let sid = &d[i..i + 8 + 4 * n];
+            let rid = u32::from_le_bytes(sid[sid.len() - 4..].try_into().unwrap());
+            if d[i + 7] == 12 || rid >= 1000 {
+                *count.entry(sid.to_vec()).or_default() += 1;
+            }
+            i += 8 + 4 * n;
+        } else {
+            i += 1;
+        }
+    }
+    count.into_iter().max_by_key(|(_, c)| *c).map(|(s, _)| s)
+}
+
 pub struct Options {
     /// drive letter the installation calls itself ("C:")
     pub drive: String,
     /// installed CBS packages (lowercase .mum names without extension), SOFTWARE only
     pub installed_mums: Option<HashSet<String>>,
     pub device_reset: DeviceReset,
+    /// user profile folders on the disk (SOFTWARE: ProfileList rule)
+    pub profiles: Vec<Profile>,
 }
 
 #[derive(Default, Debug)]
@@ -142,13 +196,16 @@ pub struct Report {
     pub devices_reinstall: usize,
     pub device_reset: bool,
     pub classes_from_logs: usize,
+    pub profiles_fixed: usize,
+    pub computer_name: Option<String>,
 }
 
 impl Report {
     pub fn actions(&self) -> usize {
         self.undeleted + self.keys_from_wim + self.values_from_wim + self.lost_state.len()
             + self.hw_profile.is_some() as usize + self.driver_keys_rebuilt + self.devices_reinstall
-            + self.device_reset as usize + self.classes_from_logs
+            + self.device_reset as usize + self.classes_from_logs + self.profiles_fixed
+            + self.computer_name.is_some() as usize
     }
     fn add(&mut self, kind: &str, path: &str, detail: &str) {
         self.log.push((kind.into(), path.into(), detail.into()));
@@ -472,6 +529,74 @@ impl<'a> Repair<'a> {
     }
 }
 
+const PROFILE_LIST: &str = r"Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+/// Accounts whose ProfileList entry is gone get it back; without it Windows logs the user
+/// on with a new, empty profile ("user.COMPUTER", Start menu and apps broken). If Windows
+/// already made such a duplicate, the entry is pointed back to the oldest folder.
+fn fix_profiles(vm: &mut Key, profiles: &[Profile], rep: &mut Report) {
+    let Some(pl) = vm.get_mut(PROFILE_LIST) else { return };
+    let mut by_sid: HashMap<String, &Profile> = HashMap::new();
+    for p in profiles {
+        let s = sid_string(&p.sid);
+        if by_sid.get(&s).map(|q| p.created < q.created).unwrap_or(true) {
+            by_sid.insert(s, p);
+        }
+    }
+    let mut sids: Vec<_> = by_sid.into_iter().collect();
+    sids.sort_by(|a, b| a.0.cmp(&b.0));
+    for (sid, p) in sids {
+        let low = lower(&sid);
+        match pl.subs.get_mut(&low) {
+            None => {
+                let mut k = Key::new_like(&sid, pl);
+                for (n, t, d) in [
+                    ("ProfileImagePath", 2, utf16z(&p.path)), ("Flags", 4, 0u32.to_le_bytes().to_vec()),
+                    ("State", 4, 0u32.to_le_bytes().to_vec()), ("FullProfile", 4, 1u32.to_le_bytes().to_vec()),
+                    ("Sid", 3, p.sid.clone()),
+                ] {
+                    k.set_value(n, t, d);
+                }
+                pl.subs.insert(low, k);
+                rep.profiles_fixed += 1;
+                rep.add("profile entry rebuilt", &sid, &p.path);
+            }
+            Some(k) => {
+                let cur = k.string("ProfileImagePath").unwrap_or_default();
+                if !cur.eq_ignore_ascii_case(&p.path) && profiles.iter().any(|q| q.path.eq_ignore_ascii_case(&cur)) {
+                    k.set_value("ProfileImagePath", 2, utf16z(&p.path));
+                    k.set_value("State", 4, 0u32.to_le_bytes().to_vec());
+                    rep.profiles_fixed += 1;
+                    rep.add("profile entry pointed back", &sid, &format!("{cur} -> {}", p.path));
+                }
+            }
+        }
+    }
+}
+
+/// ComputerName restored from the WIM is its placeholder; the real name survives as the
+/// TCP/IP host name.
+fn fix_computer_name(cs: &mut Key, wim_cs: Option<&Key>, rep: &mut Report) {
+    let placeholder = wim_cs.and_then(|w| w.get(r"Control\ComputerName\ComputerName"))
+        .and_then(|k| k.string("ComputerName")).unwrap_or_else(|| "MINWINPC".into());
+    let Some(host) = cs.get(r"Services\Tcpip\Parameters").and_then(|k| k.string("Hostname").or_else(|| k.string("NV Hostname"))) else { return };
+    if host.is_empty() {
+        return;
+    }
+    let Some(k) = cs.get_mut(r"Control\ComputerName\ComputerName") else { return };
+    let cur = k.string("ComputerName").unwrap_or_default();
+    if !cur.is_empty() && !cur.eq_ignore_ascii_case(&placeholder) {
+        return;
+    }
+    let name: String = host.to_uppercase().chars().take(15).collect();
+    if name.eq_ignore_ascii_case(&cur) {
+        return;
+    }
+    k.set_value("ComputerName", 1, utf16z(&name));
+    rep.computer_name = Some(name.clone());
+    rep.add("computer name", r"Control\ComputerName\ComputerName", &format!("{cur} -> {name}"));
+}
+
 fn new_guid() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut b = [0u8; 16];
@@ -562,8 +687,12 @@ pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &O
     r.merge(vm);
     r.undelete(vm, &deleted); // 2nd pass: parents that only came back from the WIM
 
-    if let Some((vcs, _)) = r.cs_map.clone() {
+    if !system {
+        fix_profiles(vm, &opts.profiles, &mut r.rep);
+    }
+    if let Some((vcs, wcs)) = r.cs_map.clone() {
         if let Some(cs) = vm.get_mut(&vcs) {
+            fix_computer_name(cs, wim.get(&wcs), &mut r.rep);
             r.fix_hwprofile(cs);
             let damaged = Repair::devices_without_driver_key(cs).len();
             let reset = match opts.device_reset {
