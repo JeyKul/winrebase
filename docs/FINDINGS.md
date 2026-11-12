@@ -264,3 +264,35 @@ DeviceClasses, Power, NSI) were left to Windows/PnP to recreate.
 | SYSTEM | keys incl. Lsa boot key, ACPI, Class | logs, free cells, stale log records (boot key), WIM, PnP reinstall | boots |
 
 No backup was used for any repair. The healthy install gets zero actions.
+
+## 2026-11-12 — Test 4: "pour the WIM back" + boot partition gone
+
+Damage (done from the install ISO, so in-use files could be deleted too):
+- **GPT entry of the EFI partition deleted.** Firmware fell through to the CD. Content of
+  the ESP untouched (FAT32 boot sector at 1 MiB, all 147 files).
+- **~108 000 of ~121 000 files under `\Windows` deleted**: nearly all of System32/SysWOW64,
+  `servicing\Packages`, most of WinSxS, `Temp`, the hives `COMPONENTS`, `ELAM`,
+  `BCD-Template`, and the tool's own `winrebase-backup`.
+- Registry hives SYSTEM/SOFTWARE/SAM/SECURITY/DEFAULT/DRIVERS survived, essentially intact.
+
+### Repair
+
+1. **GPT**: re-created the ESP entry from the FAT32 boot sector (start 2048, 204 800
+   sectors), type ESP, **original partition GUID** (the BCD references it), attribute 63
+   (no drive letter), moved back to slot 1 (`sgdisk -n/-t/-u/-A`, `--transpose`).
+2. **`proto/fullrestore.py`** (the original WIM idea): when damage is massive, WinSxS folders
+   and `COMPONENTS` can't be the authority any more. Restore everything the WIM has and the
+   volume lacks, except exclusions, known moves and CBS packages the SOFTWARE hive doesn't
+   list (38 skipped).
+   - 8 739 files re-linked to surviving WinSxS twins
+   - 99 510 files extracted with `wimextract` (keeps hardlink groups: 51 649 linked files),
+     packed as tar, `tar-in` on an ntfs-3g mount (keeps hardlinks) → 7.5 GB in ~30 s
+   - 20 265 directories; security descriptors from the WIM for every restored file/dir
+     (once per hardlink group), 0 failures
+   - `COMPONENTS`, `ELAM`, `BCD-Template` from the WIM
+3. Result: 121 314 files identical to the WIM; only the 39 intentional skips differ.
+
+Caveats:
+- `COMPONENTS` from the WIM predates post-install servicing (e.g. WMIC removal). Servicing
+  metadata may be slightly inconsistent → check `DISM /ScanHealth`.
+- `\Windows\Temp` was gone: scripts must not assume it exists (now run from the volume root).
