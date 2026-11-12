@@ -2,6 +2,7 @@
 //! winrebase — minimal native GUI for WinPE.
 
 mod engine;
+mod reg;
 mod wim;
 mod win;
 
@@ -29,6 +30,7 @@ const ID_REPAIR: i32 = 107;
 const ID_LOG: i32 = 108;
 const ID_PROGRESS: i32 = 109;
 const ID_STATUS: i32 = 110;
+const ID_DEVRESET: i32 = 111;
 
 const WM_ENGINE: u32 = WM_APP + 1;
 const WM_SEARCHED: u32 = WM_APP + 2;
@@ -81,7 +83,7 @@ fn set_status(frac: f64, text: &str) {
 
 fn set_busy(busy: bool) {
     UI.with(|u| u.borrow_mut().busy = busy);
-    for id in [ID_INSTALL, ID_WIM, ID_BROWSE, ID_SEARCH, ID_UNMATCHED, ID_ANALYZE] {
+    for id in [ID_INSTALL, ID_WIM, ID_BROWSE, ID_SEARCH, ID_UNMATCHED, ID_DEVRESET, ID_ANALYZE] {
         unsafe { EnableWindow(h(id), (!busy) as i32) };
     }
     let can_repair = !busy && UI.with(|u| u.borrow().plan.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
@@ -103,6 +105,11 @@ fn sink(main: isize) -> engine::Sink {
 }
 
 // ------------------------------------------------------------------ actions
+
+/// Worker thread with a big stack (registry trees are walked recursively).
+fn worker(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new().stack_size(256 << 20).spawn(f).expect("worker thread");
+}
 
 fn start_search() {
     set_busy(true);
@@ -136,7 +143,7 @@ fn fill_sources() {
 
 fn browse() {
     let mut buf = vec![0u16; 1024];
-    let filter = wide("Windows images (*.wim;*.esd)\0*.wim;*.esd\0All files\0*.*\0");
+    let filter = wide("Windows images and ISOs (*.wim;*.esd;*.iso)\0*.wim;*.esd;*.iso\0All files\0*.*\0");
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
     ofn.hwndOwner = UI.with(|u| u.borrow().main) as HWND;
@@ -148,6 +155,27 @@ fn browse() {
         return;
     }
     let path = from_wide_buf(&buf);
+    if path.to_lowercase().ends_with(".iso") {
+        match engine::mount_iso(&path) {
+            Ok((d, _)) => {
+                append_log(&format!("Mounted {path} as {}", &d[..2]));
+                let imgs = engine::images_on(&d);
+                if imgs.is_empty() {
+                    append_log("  no install.wim/install.esd on it");
+                }
+                for p in imgs {
+                    add_image(&p);
+                }
+            }
+            Err(e) => append_log(&format!("Can't mount {path}: {e}")),
+        }
+        return;
+    }
+    add_image(&path);
+}
+
+fn add_image(path: &str) {
+    let path = path.to_string();
     match wim::Wim::open(&path) {
         Ok(w) => {
             let imgs = w.images();
@@ -185,14 +213,15 @@ fn selection() -> Option<(Install, Source, bool)> {
 
 fn start_analyze() {
     let Some((inst, src, unmatched)) = selection() else { return };
+    let device_reset = checked(ID_DEVRESET);
     UI.with(|u| u.borrow_mut().plan = None);
     set_busy(true);
     append_log("");
     append_log(&format!("=== Analyze {} ===", inst.label()));
     let main = UI.with(|u| u.borrow().main);
-    std::thread::spawn(move || {
+    worker(move || {
         let mut out = Out::new(sink(main));
-        let r = engine::analyze(&inst.root, &src, unmatched, &mut out);
+        let r = engine::analyze(&inst.root, &src, unmatched, device_reset, &mut out);
         if let Err(e) = &r {
             out.log(format!("Analysis failed: {e}"));
         }
@@ -204,8 +233,11 @@ fn start_repair() {
     let Some(plan) = UI.with(|u| u.borrow_mut().plan.take()) else { return };
     let msg = format!(
         "Repair {} now?\n\n{} files restored from the image, {} re-linked, {} folders created, \
-         {} damaged files replaced.{}\n\nMake sure you have a backup if the data matters.",
+         {} damaged files replaced.\nRegistry hives repaired: {}.{}{}\n\nThe originals of changed hives are kept in \
+         \\Windows\\winrebase-backup. Make sure you have a backup if the data matters.",
         &plan.root[..2], plan.extract.len(), plan.links.len(), plan.mkdirs.len(), plan.delete.len(),
+        if plan.reg_changes.is_empty() { "none".to_string() } else { plan.reg_changes.join(", ") },
+        if plan.device_reset { "\nClean device start: Windows detects all hardware again on the next boot." } else { "" },
         if plan.unmatched { "\n\nUNMATCHED IMAGE: Windows files are replaced with the image's versions \
                               and the boot files are rebuilt." } else { "" });
     let r = unsafe {
@@ -220,7 +252,7 @@ fn start_repair() {
     append_log("");
     append_log("=== Repair ===");
     let main = UI.with(|u| u.borrow().main);
-    std::thread::spawn(move || {
+    worker(move || {
         let mut out = Out::new(sink(main));
         if let Err(e) = engine::repair(&plan, &mut out) {
             out.log(format!("Repair failed: {e}"));
@@ -258,6 +290,8 @@ fn create_controls(hwnd: HWND) {
        0, 0, 203, font);
     mk("BUTTON", "Allow unmatched WIM/ESD (last resort: replaces Windows files and rebuilds boot files)",
        BS_AUTOCHECKBOX as u32 | WS_TABSTOP, 0, ID_UNMATCHED, font);
+    mk("BUTTON", "Clean device start (Windows detects all hardware again — automatic when the device registry is damaged)",
+       BS_AUTOCHECKBOX as u32 | WS_TABSTOP, 0, ID_DEVRESET, font);
     mk("BUTTON", "Analyze", BS_PUSHBUTTON as u32 | WS_TABSTOP, 0, ID_ANALYZE, font);
     mk("BUTTON", "Repair", BS_PUSHBUTTON as u32 | WS_TABSTOP, 0, ID_REPAIR, font);
     mk("EDIT", "", ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL,
@@ -289,6 +323,8 @@ fn layout(w: i32, hgt: i32) {
     place(203, m + lw, y, w - 2 * m - lw, s(20));
     y += s(26);
     place(ID_UNMATCHED, m, y, w - 2 * m, s(22));
+    y += s(24);
+    place(ID_DEVRESET, m, y, w - 2 * m, s(22));
     y += s(30);
     place(ID_ANALYZE, m, y, s(110), s(30));
     place(ID_REPAIR, m + s(120), y, s(110), s(30));
@@ -378,7 +414,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if let Ok(p) = b.downcast::<Option<Plan>>() {
                 if let Some(p) = *p {
                     if p.is_empty() {
-                        append_log("Nothing to repair — Windows files match the image.");
+                        append_log("Nothing to repair — Windows files and registry match the image.");
                     } else {
                         append_log("Click Repair to apply.");
                     }

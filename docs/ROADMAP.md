@@ -22,13 +22,17 @@
 - [ ] Scenarios 1–7 pass
 
 ## M3 — WinPE backend
-- [ ] Win32 file backend (`BackupWrite`, hardlinks, reparse points)
-- [ ] Hive backend (`offreg.dll` or `RegLoadKey`)
-- [ ] WinPE build script (inject binary + deps)
-- [ ] Scenarios 1–10 pass on both backends
+- [x] Win32 file backend (wimlib extract, hardlinks to intact copies, WIM ACLs)
+- [x] Hive backend: own pure-Rust reader/writer (`app/src/reg`), no `RegLoadKey`/`offreg.dll`
+  (the WinPE kernel would write to the broken hive when loading it)
+- [x] Registry stage: log replay with gap check, undelete, lost state DBs, WIM merge,
+  IDConfigDB, driver keys, clean device start
+- [x] WinPE build script (`tools/build-iso.sh`, takes the Windows .iso directly)
+- [x] WIM/ESD from an .iso inside WinPE (VirtDisk attach, Browse or Search)
+- [ ] Scenarios 1–10 pass
 
 ## M4 — Usability
-- [ ] TUI / simple GUI
+- [x] Simple native GUI (Analyze / Repair, progress, log)
 - [ ] Bootable images published as releases
 - [ ] Docs for technicians
 

@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use crate::reg::{self, hive::{Key, Reader}};
 use crate::wim::{Entry, Image, Wim};
-use crate::win::{self, Hive};
+use crate::win;
 
 pub enum Ev {
     Log(String),
@@ -72,15 +73,13 @@ pub fn find_installs() -> Vec<Install> {
             continue;
         }
         let mut i = Install { root: d.clone(), build: 0, ubr: 0, edition: "?".into(), name: "Windows".into() };
-        if let Ok(h) = Hive::load("WR_PROBE", &sw) {
-            if let Some(k) = h.key("Microsoft\\Windows NT\\CurrentVersion") {
-                i.build = k.string("CurrentBuild").and_then(|s| s.parse().ok()).unwrap_or(0);
-                i.ubr = k.dword("UBR").unwrap_or(0);
-                i.edition = k.string("EditionID").unwrap_or_default();
-                i.name = k.string("ProductName").unwrap_or_default();
-                if i.build >= 22000 {
-                    i.name = i.name.replace("Windows 10", "Windows 11");
-                }
+        if let Some(k) = read_key(&sw, r"Microsoft\Windows NT\CurrentVersion") {
+            i.build = k.string("CurrentBuild").and_then(|s| s.parse().ok()).unwrap_or(0);
+            i.ubr = k.dword("UBR").unwrap_or(0);
+            i.edition = k.string("EditionID").unwrap_or_default();
+            i.name = k.string("ProductName").unwrap_or_default();
+            if i.build >= 22000 {
+                i.name = i.name.replace("Windows 10", "Windows 11");
             }
         }
         out.push(i);
@@ -113,6 +112,7 @@ impl Source {
 /// Look for install.wim/esd and *.wim/*.esd in drive roots, \sources and one folder deep.
 pub fn find_sources(out: &mut Out) -> Vec<Source> {
     let mut files = Vec::new();
+    let mut isos = Vec::new();
     for d in win::drives() {
         let mut dirs = vec![d.clone(), format!("{d}sources\\")];
         if let Ok(rd) = std::fs::read_dir(&d) {
@@ -133,8 +133,22 @@ pub fn find_sources(out: &mut Out) -> Vec<Source> {
                     if (n.ends_with(".wim") || n.ends_with(".esd")) && n != "boot.wim" && n != "winre.wim" {
                         files.push(format!("{dir}{}", e.file_name().to_string_lossy()));
                     }
+                    if n.ends_with(".iso") {
+                        isos.push(format!("{dir}{}", e.file_name().to_string_lossy()));
+                    }
                 }
             }
+        }
+    }
+    for iso in isos {
+        match mount_iso(&iso) {
+            Ok((d, new)) => {
+                if new {
+                    out.log(format!("  mounted {iso} as {}", &d[..2]));
+                }
+                files.extend(images_on(&d));
+            }
+            Err(e) => out.log(format!("  can't mount {iso}: {e}")),
         }
     }
     files.sort();
@@ -151,6 +165,36 @@ pub fn find_sources(out: &mut Out) -> Vec<Source> {
         }
     }
     out_v
+}
+
+/// Mounted .iso files (path -> drive root), so a second search doesn't attach them again.
+static MOUNTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Attach an .iso; returns (drive root, newly mounted).
+pub fn mount_iso(path: &str) -> Result<(String, bool), String> {
+    let mut m = MOUNTED.lock().unwrap();
+    if let Some((_, d)) = m.iter().find(|(p, _)| p.eq_ignore_ascii_case(path)) {
+        return Ok((d.clone(), false));
+    }
+    let d = win::mount_iso(path)?;
+    m.push((path.to_string(), d.clone()));
+    Ok((d, true))
+}
+
+/// install.wim/esd of a Windows ISO (or any *.wim/*.esd in its root and \sources).
+pub fn images_on(drive: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in [drive.to_string(), format!("{drive}sources\\")] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_lowercase();
+                if (n.ends_with(".wim") || n.ends_with(".esd")) && n != "boot.wim" && n != "winre.wim" {
+                    out.push(format!("{dir}{}", e.file_name().to_string_lossy()));
+                }
+            }
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------ rules
@@ -196,11 +240,27 @@ pub struct Plan {
     pub links: Vec<(String, String)>, // (new, existing) relative to root
     pub extract_bytes: u64,
     pub hives_replace: Vec<String>,
+    /// hives that will be rewritten
+    pub reg_changes: Vec<String>,
+    pub device_reset: bool,
 }
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.mkdirs.is_empty() && self.extract.is_empty() && self.links.is_empty()
+        self.mkdirs.is_empty() && self.extract.is_empty() && self.links.is_empty() && self.reg_changes.is_empty()
+    }
+}
+
+fn log_registry(items: &[RegItem], out: &mut Out) {
+    for it in items {
+        if it.summary.is_empty() {
+            out.log(format!("  {:<10} ok", it.hive));
+            continue;
+        }
+        out.log(format!("  {:<10} {}", it.hive, it.summary[0]));
+        for s in &it.summary[1..] {
+            out.log(format!("  {:<10} {s}", ""));
+        }
     }
 }
 
@@ -213,38 +273,31 @@ struct Ctx {
 fn load_ctx(root: &str, out: &mut Out) -> Ctx {
     let mut c = Ctx { cbs: None, owned: None, comp_keys: None };
     let sw = format!("{root}Windows\\System32\\config\\SOFTWARE");
-    match Hive::load("WR_SOFTWARE", &sw) {
-        Ok(h) => {
-            if let Some(k) = h.key("Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\Packages") {
-                let s: HashSet<String> = k.subkeys().into_iter().map(|x| x.to_lowercase()).collect();
-                out.log(format!("  servicing database: {} packages", s.len()));
-                c.cbs = Some(s);
-            }
+    match read_key(&sw, r"Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages") {
+        Some(k) => {
+            let s: HashSet<String> = k.subs.keys().cloned().collect();
+            out.log(format!("  servicing database: {} packages", s.len()));
+            c.cbs = Some(s);
         }
-        Err(e) => out.log(format!("  SOFTWARE hive not loadable ({e}) — package rules off")),
+        None => out.log("  SOFTWARE hive not readable — package rules off"),
     }
     let cp = format!("{root}Windows\\System32\\config\\COMPONENTS");
     if win::exists(&cp) {
-        match Hive::load("WR_COMPONENTS", &cp) {
-            Ok(h) => {
-                if let Some(k) = h.key("DerivedData\\Components") {
-                    let mut keys = HashSet::new();
-                    let mut owned = HashSet::new();
-                    for name in k.subkeys() {
-                        let l = name.to_lowercase();
-                        if let Some(s) = k.sub(&name) {
-                            if s.value_names().iter().any(|v| v.starts_with("c!")) {
-                                owned.insert(l.clone());
-                            }
-                        }
-                        keys.insert(l);
+        match read_key(&cp, r"DerivedData\Components") {
+            Some(k) => {
+                let mut keys = HashSet::new();
+                let mut owned = HashSet::new();
+                for (l, sub) in &k.subs {
+                    if sub.values.iter().any(|v| v.name.starts_with("c!")) {
+                        owned.insert(l.clone());
                     }
-                    out.log(format!("  component store: {} components, {} installed", keys.len(), owned.len()));
-                    c.owned = Some(owned);
-                    c.comp_keys = Some(keys);
+                    keys.insert(l.clone());
                 }
+                out.log(format!("  component store: {} components, {} installed", keys.len(), owned.len()));
+                c.owned = Some(owned);
+                c.comp_keys = Some(keys);
             }
-            Err(e) => out.log(format!("  COMPONENTS hive not loadable ({e})")),
+            None => out.log("  COMPONENTS hive not readable"),
         }
     } else {
         out.log("  COMPONENTS hive is missing");
@@ -252,7 +305,165 @@ fn load_ctx(root: &str, out: &mut Out) -> Ctx {
     c
 }
 
-pub fn analyze(root: &str, src: &Source, unmatched: bool, out: &mut Out) -> Result<Plan, String> {
+// ------------------------------------------------------------------ registry
+
+/// Hive file + its logs, logs replayed in memory. Read only, never through RegLoadKey (the
+/// WinPE kernel would write to the broken hive).
+fn read_hive(path: &str) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let primary = std::fs::read(path).ok()?;
+    let logs: Vec<Vec<u8>> = ["LOG1", "LOG2"].iter()
+        .filter_map(|e| std::fs::read(format!("{path}.{e}")).ok()).collect();
+    Some((primary, logs))
+}
+
+/// One key (values + direct subkeys, shallow) of an offline hive.
+fn read_key(path: &str, key: &str) -> Option<Key> {
+    let (primary, logs) = read_hive(path)?;
+    let lr: Vec<&[u8]> = logs.iter().map(|l| l.as_slice()).collect();
+    let (bytes, _) = reg::log::replay(&primary, &lr).ok()?;
+    Reader::new(&bytes).ok()?.find(key)
+}
+
+/// Hives repaired against the WIM, and hives that only get their logs replayed.
+const WIM_HIVES: &[&str] = &["SYSTEM", "SOFTWARE", "DEFAULT"];
+const LOG_HIVES: &[&str] = &["SECURITY", "SAM", "COMPONENTS", "DRIVERS", "ELAM", "BBI"];
+
+pub struct RegItem {
+    pub hive: String,
+    pub summary: Vec<String>,
+    pub changes: bool,
+}
+
+fn installed_mums(root: &str) -> Option<HashSet<String>> {
+    let rd = std::fs::read_dir(format!("{root}Windows\\servicing\\Packages")).ok()?;
+    Some(rd.flatten().filter_map(|e| {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        n.strip_suffix(".mum").map(|x| x.to_string())
+    }).collect())
+}
+
+/// Check (apply = false) or repair (apply = true) the registry hives of `root`.
+pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_reset: bool, apply: bool,
+                out: &mut Out) -> Result<Vec<RegItem>, String> {
+    let cfg = format!("{root}Windows\\System32\\config\\");
+    let work = format!("{}winrebase\\wim\\", win::system_drive());
+    if !unmatched {
+        out.progress(0.0, "Reading registry hives from the WIM…");
+        let paths: Vec<String> = WIM_HIVES.iter().map(|h| format!("Windows\\System32\\config\\{h}")).collect();
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).map_err(|e| format!("{work}: {e}"))?;
+        Wim::open(wim_path)?.extract(image, &work, &paths, &mut |_, _| {})
+            .map_err(|e| format!("extracting the registry hives from the WIM: {e}"))?;
+    } else {
+        out.log("  unmatched WIM: registry is only checked for damaged logs, not compared");
+    }
+    let drive = read_key(&format!("{cfg}SOFTWARE"), r"Microsoft\Windows NT\CurrentVersion")
+        .and_then(|k| k.string("SystemRoot")).and_then(|s| s.get(..2).map(|x| x.to_uppercase()))
+        .unwrap_or_else(|| "C:".into());
+    let opts = reg::Options {
+        drive,
+        installed_mums: installed_mums(root),
+        device_reset: if device_reset { reg::DeviceReset::Always } else { reg::DeviceReset::Auto },
+    };
+    let backup = format!("{root}Windows\\winrebase-backup\\{}\\config\\", stamp());
+    let all: Vec<(&str, bool)> = WIM_HIVES.iter().map(|h| (*h, !unmatched))
+        .chain(LOG_HIVES.iter().map(|h| (*h, false))).collect();
+    let mut items = Vec::new();
+    for (n, (hive, compare)) in all.iter().enumerate() {
+        out.progress(0.1 + 0.85 * n as f64 / all.len() as f64, format!("Registry: {hive}…"));
+        let path = format!("{cfg}{hive}");
+        let mut item = RegItem { hive: hive.to_string(), summary: Vec::new(), changes: false };
+        let Some((primary, logs)) = read_hive(&path) else {
+            if win::exists(&path) || *compare {
+                item.summary.push("can't be read".into());
+                items.push(item);
+            }
+            continue;
+        };
+        let wim = if *compare { std::fs::read(format!("{work}Windows\\System32\\config\\{hive}")).ok() } else { None };
+        let lr: Vec<&[u8]> = logs.iter().map(|l| l.as_slice()).collect();
+        let o = match reg::process(&primary, &lr, wim.as_deref(), &opts) {
+            Ok(o) => o,
+            Err(e) => {
+                item.summary.push(format!("can't be processed: {e}"));
+                items.push(item);
+                continue;
+            }
+        };
+        if o.replay.changed() {
+            item.summary.push(format!("logs: {}", o.replay.describe()));
+        }
+        if !o.unreadable.is_empty() {
+            item.summary.push(format!("{} damaged keys left out", o.unreadable.len()));
+        }
+        if let Some(r) = &o.report {
+            if r.undeleted > 0 { item.summary.push(format!("{} deleted keys recovered", r.undeleted)); }
+            if r.keys_from_wim + r.values_from_wim > 0 {
+                item.summary.push(format!("{} keys / {} values added from the WIM", r.keys_from_wim, r.values_from_wim));
+            }
+            for l in &r.lost_state { item.summary.push(format!("lost database restored: {l}")); }
+            if let Some(p) = r.hw_profile { item.summary.push(format!("hardware profile {p:04} rebuilt")); }
+            if r.driver_keys_rebuilt > 0 { item.summary.push(format!("{} driver keys rebuilt", r.driver_keys_rebuilt)); }
+            if r.devices_reinstall > 0 { item.summary.push(format!("{} devices reinstalled on next boot", r.devices_reinstall)); }
+            if r.device_reset { item.summary.push("clean device start: Windows detects all hardware again".into()); }
+            if r.classes_from_logs > 0 { item.summary.push(format!("{} class names recovered (Lsa boot key)", r.classes_from_logs)); }
+        }
+        item.changes = o.output.is_some();
+        if apply {
+            if let Some(bytes) = &o.output {
+                write_hive(&path, bytes, &backup, hive)?;
+                item.summary.push(format!("written ({} MB), original in {backup}", bytes.len() / 1_000_000));
+                if let Some(r) = &o.report {
+                    let rep: String = r.log.iter().map(|(k, p, d)| format!("{k}\t{p}\t{d}\r\n")).collect();
+                    let _ = std::fs::write(format!("{backup}{hive}.repair.txt"), rep);
+                }
+            }
+        }
+        items.push(item);
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    out.progress(1.0, "Registry done");
+    Ok(items)
+}
+
+/// Back up hive + logs, write the new hive next to it, swap it in, empty the logs.
+fn write_hive(path: &str, bytes: &[u8], backup: &str, hive: &str) -> Result<(), String> {
+    std::fs::create_dir_all(backup).map_err(|e| format!("backup folder: {e}"))?;
+    for ext in ["", ".LOG1", ".LOG2"] {
+        let f = format!("{path}{ext}");
+        if win::exists(&f) {
+            std::fs::copy(&f, format!("{backup}{hive}{ext}")).map_err(|e| format!("backup {f}: {e}"))?;
+        }
+    }
+    let tmp = format!("{path}.winrebase-new");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {tmp}: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace {path}: {e}"))?;
+    for ext in [".LOG1", ".LOG2"] {
+        let f = format!("{path}{ext}");
+        if win::exists(&f) {
+            std::fs::OpenOptions::new().write(true).truncate(true).open(&f)
+                .map_err(|e| format!("empty {f}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn stamp() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, out: &mut Out) -> Result<Plan, String> {
     let t0 = Instant::now();
     out.progress(0.0, "Reading WIM…");
     out.log(format!("Source: {}", src.label(None)));
@@ -462,6 +673,13 @@ pub fn analyze(root: &str, src: &Source, unmatched: bool, out: &mut Out) -> Resu
         out.log(format!("     {n:7}  {k}"));
     }
     drop(wim);
+
+    out.log("Checking the registry…");
+    let items = registry(root, &src.path, src.image.index, unmatched, device_reset, false, out)?;
+    log_registry(&items, out);
+    plan.reg_changes = items.iter().filter(|i| i.changes).map(|i| i.hive.clone()).collect();
+    plan.device_reset = device_reset;
+    out.log(format!("  hives to repair: {}", if plan.reg_changes.is_empty() { "none".into() } else { plan.reg_changes.join(", ") }));
     Ok(plan)
 }
 
@@ -508,6 +726,16 @@ pub fn repair(plan: &Plan, out: &mut Out) -> Result<(), String> {
         if let Err(e) = win::hardlink(&format!("{root}{new}"), &format!("{root}{existing}")) {
             errors += 1;
             if errors < 20 { out.log(format!("  ! {e}")); }
+        }
+    }
+    if !plan.reg_changes.is_empty() {
+        out.log("Repairing the registry…");
+        match registry(root, &plan.wim_path, plan.image, plan.unmatched, plan.device_reset, true, out) {
+            Ok(items) => log_registry(&items, out),
+            Err(e) => {
+                errors += 1;
+                out.log(format!("  ! registry: {e}"));
+            }
         }
     }
     out.progress(0.92, "Checking boot files…");

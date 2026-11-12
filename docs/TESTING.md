@@ -11,7 +11,18 @@ work from that state, and its own rollback set is the only safety net.
 - Install ISO: `Win11_25H2_German_x64.iso` → `install.wim`, build **26200.6584**, 10 editions.
 - Clean WIM = the install ISO as long as the VM stays at 26200.6584. Once the VM updates,
   build a matching ISO (UUP dump) for the new UBR.
-- Disk access from the host while the VM is **shut off**: `qemu-nbd` (read-only for analysis).
+- Disk access from the host while the VM is **shut off**: `guestfish --ro -d win11-2`
+  (read-only), or `guestmount` for `find`/`stat`.
+- **Try repairs on a qcow2 overlay, never on the disk itself**:
+  `qemu-img create -f qcow2 -b /var/lib/libvirt/images/win11-2.qcow2 -F qcow2 ov.qcow2`,
+  patch the overlay with `guestfish -a ov.qcow2`, boot it as a transient domain
+  (`virsh create`, copy of the win11-2 XML without TPM/network, own NVRAM copy). Each try
+  starts from a fresh overlay; the real disk stays broken until the fix is proven.
+  Bisecting a bad hive this way (graft subtrees from the repaired hive into a known-good
+  one, one boot each) found the IDConfigDB and DeviceClasses rules.
+- Host-side registry test: `app/regtool` runs the WinPE app's registry code on Linux
+  (`cargo build --release --target x86_64-unknown-linux-gnu`, then
+  `regtool HIVE OUT --wim WIM_HIVE --log HIVE.LOG1 --log HIVE.LOG2`).
 - Test the tool from both:
   - a WinPE ISO attached as CD
   - a Linux live ISO attached as CD
