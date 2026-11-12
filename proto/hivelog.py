@@ -99,14 +99,16 @@ def replay(hive_path, out_path, log_paths, verbose=True):
     # Apply logs in order of their first entry's sequence number.
     logs.sort(key=lambda l: l["entries"][0]["seq"])
 
-    expected = None
+    # The first entry to apply must continue the primary file (seq == seq2). Entries
+    # after a gap would be patched onto a base they weren't written for.
+    expected = seq2
     applied = 0
     last = None
     for log in logs:
         for e in log["entries"]:
             if e["seq"] < seq2:
                 continue            # already in the primary file
-            if expected is not None and e["seq"] != expected:
+            if e["seq"] != expected:
                 if verbose:
                     print(f"  gap: expected seq {expected}, got {e['seq']} -> stop this log")
                 break

@@ -168,18 +168,142 @@ class Repair:
             self.copy_into(self.wim, self.vm, "")
 
 
+def prune_interfaces(vm, rep, log):
+    r"""Control\DeviceClasses\{guid}\##?#<device>#{guid} must have its reference-string
+    subkey(s) "#..." (where the symbolic link lives). Keys that came back half (undelete,
+    deleted children) stop the kernel with IO1_INITIALIZATION_FAILED (0x69). Dropped ones
+    are re-created by PnP when the device starts."""
+    cs = get(vm, list(rep.cs_map)[0])
+    dc = get(cs, r"Control\DeviceClasses")
+    n = 0
+    if dc is None:
+        return 0
+    for g in dc["subs"].values():
+        for low, inst in list(g["subs"].items()):
+            if low.startswith("##?#") and not any(c.startswith("#") for c in inst["subs"]):
+                del g["subs"][low]
+                log.append(("incomplete interface dropped", r"Control\DeviceClasses\%s\%s" % (g["name"], inst["name"]), ""))
+                n += 1
+    return n
+
+
+def fix_hwprofile(vm, rep, log):
+    """The WIM's Control\\IDConfigDB is the pre-setup template (CurrentConfig 0, only the
+    "Pristine" profile 0000). Setup clones it into profile 0001+ and points CurrentConfig
+    there; with the template the boot loader stops with 0xc0000001. Rebuild it from the
+    profiles the machine still has under <ControlSet>\\Hardware Profiles."""
+    import uuid
+    cs = get(vm, list(rep.cs_map)[0])
+    idc = get(cs, r"Control\IDConfigDB")
+    profiles = get(cs, "Hardware Profiles")
+    if idc is None or profiles is None:
+        return 0
+    vals = {v[0].lower(): v for v in idc["values"]}
+    cur = int.from_bytes(vals["currentconfig"][2][:4], "little") if "currentconfig" in vals else 0
+    nums = [int(n) for n in profiles["subs"] if n.isdigit() and int(n) > 0]
+    hp = idc["subs"].get("hardware profiles")
+    if cur and hp is not None and "%04d" % cur in hp["subs"]:
+        return 0                                    # intact
+    if not nums:
+        return 0
+    n = max(nums)
+    dword = lambda x: x.to_bytes(4, "little")
+    sz = lambda s: (s + "\0").encode("utf-16-le")
+
+    def setv(k, name, t, data):
+        k["values"] = [v for v in k["values"] if v[0].lower() != name.lower()] + [(name, t, data)]
+
+    if hp is None:
+        hp = idc["subs"]["hardware profiles"] = new_key("Hardware Profiles", idc)
+    setv(hp, "Undocked", 4, dword(n))
+    p = hp["subs"].get("%04d" % n)
+    if p is None:
+        p = hp["subs"]["%04d" % n] = new_key("%04d" % n, hp)
+    for name, t, data in [("PreferenceOrder", 4, dword(0)), ("FriendlyName", 1, sz("Undocked Profile")),
+                          ("Aliasable", 4, dword(0)), ("Cloned", 4, dword(1)),
+                          ("HwProfileGuid", 1, sz("{%s}" % uuid.uuid4()))]:
+        if name.lower() not in {v[0].lower() for v in p["values"]}:
+            setv(p, name, t, data)
+    alias = idc["subs"].get("acpialias")
+    if alias is None:
+        alias = idc["subs"]["acpialias"] = new_key("AcpiAlias", idc)
+        a = alias["subs"]["0001"] = new_key("0001", alias)
+        a["values"] = [("DockingState", 4, dword(1)), ("AcpiSerialNumber", 3, b"\0\0"),
+                       ("ProfileNumber", 4, dword(n))]
+    setv(idc, "CurrentConfig", 4, dword(n))
+    log.append(("hardware profile", r"Control\IDConfigDB", "%04d" % n))
+    return n
+
+
 CONFIGFLAG_REINSTALL = 0x20
 
 
-def flag_reinstall(vm, rep, log):
-    """Mark devices whose Control\\Class driver key is missing for reinstall. PnP then
-    reinstalls the driver and recreates the class/interface keys itself."""
+DRIVER_PROPS = "{a8b865dd-2e3d-4094-ad97-e593a70c75d6}"   # DEVPKEY_Driver* property set
+# property id -> value name in the Control\Class\{guid}\NNNN driver key
+DRIVER_KEY_VALUES = [("0004", "DriverDesc"), ("0009", "ProviderName"), ("0002", "DriverDateData"),
+                     ("0002", "DriverDate"), ("0003", "DriverVersion"), ("0005", "InfPath"),
+                     ("0006", "InfSection"), ("0008", "MatchingDeviceId")]
+
+
+REINSTALL_CLASSES = {"{4d36e972-e325-11ce-bfc1-08002be10318}"}   # Net
+
+
+def driver_key_from_props(props):
+    r"""Values of a device's driver key, rebuilt from Enum\...\Properties\{a8b865dd...}.
+    PnP keeps a copy of the driver data there, so it survives when Control\Class is lost.
+    Returns None when the essential properties are missing."""
+    import datetime
+    if props is None:
+        return None
+    raw = {}
+    for pid, k in props["subs"].items():
+        for n, t, d in k["values"]:
+            if n == "":
+                raw[pid.upper()] = (t & 0xFFFF, d)
+    if "0005" not in raw or "0004" not in raw:
+        return None
+    out = []
+    for pid, name in DRIVER_KEY_VALUES:
+        if pid not in raw:
+            continue
+        t, d = raw[pid]
+        if name == "DriverDateData":
+            out.append((name, 3, d[:8]))
+        elif name == "DriverDate":
+            ft = int.from_bytes(d[:8], "little")
+            day = datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=ft // 10)
+            out.append((name, 1, f"{day.month}-{day.day}-{day.year}\0".encode("utf-16-le")))
+        else:
+            out.append((name, 1, d))
+    return out
+
+
+def service_start(cs, name):
+    k = get(cs, "Services\\" + name) if name else None
+    if k is None:
+        return None
+    for n, t, d in k["values"]:
+        if n.lower() == "start":
+            return int.from_bytes(d[:4], "little")
+    return None
+
+
+def fix_devices(vm, rep, log):
+    r"""Devices whose Control\Class\{guid}\NNNN driver key is gone.
+
+    1. Rebuild the driver key from the device's own driver properties (Enum\...\Properties).
+       That's enough for the kernel to start the device normally.
+    2. CONFIGFLAG_REINSTALL, so PnP re-runs the INF, only when the key couldn't be rebuilt
+       or the class keeps more in it than the properties hold (network: NetCfgInstanceId,
+       Ndi keys).
+    Never reinstall a boot/system-start device: PnP can't install it before the boot disk
+    is up, and the kernel stops with IO1_INITIALIZATION_FAILED / INACCESSIBLE_BOOT_DEVICE."""
     cs = get(vm, list(rep.cs_map)[0])
     classes = get(cs, "Control\\Class")
-    n = 0
+    rebuilt = flagged = 0
 
     def walk(k, path, depth):
-        nonlocal n
+        nonlocal rebuilt, flagged
         if depth == 3:
             vals = {v[0].lower(): v for v in k["values"]}
             if "driver" not in vals:
@@ -189,16 +313,28 @@ def flag_reinstall(vm, rep, log):
             c = classes["subs"].get(guid.lower()) if classes else None
             if c is not None and inst.lower() in c["subs"]:
                 return
+            svc = vals["service"][2].decode("utf-16-le", "replace").rstrip("\0") if "service" in vals else ""
+            start = service_start(cs, svc)
+            dk = driver_key_from_props(k["subs"].get("properties", {"subs": {}})["subs"].get(DRIVER_PROPS.lower()))
+            if dk is not None and c is not None:
+                nk = c["subs"][inst.lower()] = new_key(inst, c)
+                nk["values"] = dk
+                log.append(("driver key from properties", path, drv))
+                rebuilt += 1
+            if start is not None and start <= 1:
+                return
+            if dk is not None and guid.lower() not in REINSTALL_CLASSES:
+                return
             old = int.from_bytes(vals["configflags"][2][:4], "little") if "configflags" in vals else 0
             k["values"] = [v for v in k["values"] if v[0].lower() != "configflags"] + [
                 ("ConfigFlags", 4, (old | CONFIGFLAG_REINSTALL).to_bytes(4, "little"))]
             log.append(("pnp reinstall", path, drv))
-            n += 1
+            flagged += 1
             return
         for c in k["subs"].values():
             walk(c, path + "\\" + c["name"], depth + 1)
     walk(get(cs, "Enum"), "Enum", 0)
-    return n
+    return rebuilt, flagged
 
 
 def main():
@@ -239,9 +375,15 @@ def main():
           f"{sum(1 for x in log if x[0] == 'value')} values")
     # devices whose driver key is gone: let PnP reinstall them on next boot
     if get(wim, "Select") is not None:
-        n = flag_reinstall(vm, rep, log)
+        n = prune_interfaces(vm, rep, log)
         if n:
-            print(f"devices marked for PnP reinstall: {n}")
+            print(f"incomplete device interfaces dropped: {n}")
+        n = fix_hwprofile(vm, rep, log)
+        if n:
+            print(f"hardware profile rebuilt: CurrentConfig = {n}")
+        r, f = fix_devices(vm, rep, log)
+        if r or f:
+            print(f"devices: {r} driver keys rebuilt from properties, {f} marked for PnP reinstall")
 
     # class names for restored keys that came back without one (e.g. Lsa boot key)
     for path, cls in classes_from_logs(fc, a.logs).items():

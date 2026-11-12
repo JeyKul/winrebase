@@ -296,3 +296,52 @@ Caveats:
 - `COMPONENTS` from the WIM predates post-install servicing (e.g. WMIC removal). Servicing
   metadata may be slightly inconsistent → check `DISM /ScanHealth`.
 - `\Windows\Temp` was gone: scripts must not assume it exists (now run from the volume root).
+
+## 2026-11-12 — Test 5: System32 files + SOFTWARE/SYSTEM keys deleted, torn hives
+
+Damage (as TrustedInstaller, from the running system): files in `System32` deleted, then
+~15 000 SOFTWARE keys and large parts of SYSTEM (`Control\Class` instances,
+`Control\IDConfigDB`, `DeviceClasses`, Lsa) deleted in regedit. Windows died; the WinPE app
+then restored the files (hashes = WIM), but the VM still stopped with **0xc0000001** in the
+boot manager. The WinPE app had **no registry stage at all** — files only.
+
+Hive state found:
+
+| Hive | Primary seq | Log entries | |
+|---|---|---|---|
+| SYSTEM | 457/456 (dirty) | 475–478 | **gap** 456–474 → unrecoverable from logs |
+| DEFAULT | 48/47 (dirty) | 52, 53 | gap |
+| SECURITY | 137/136 | 136, 131–135 | recoverable |
+| SOFTWARE | 1140/1140 | older | clean, but ~15 000 keys deleted |
+
+Bisected on qcow2 overlays (original disk never touched), each step = one boot:
+
+1. **`hivelog.py` bug**: log entries were applied even when the first one didn't continue
+   the primary (seq ≠ seq2). Applying 475+ onto 456 corrupts the hive. Fixed: replay must
+   start at `seq2`; on a gap the primary is used as is (it was structurally clean here).
+2. SOFTWARE repaired by `regrepair2.py` → fine.
+3. SYSTEM: **0xc0000001** → `Control\IDConfigDB` came back from the WIM. The WIM copy is
+   the *pre-setup template* (`CurrentConfig 0`, only the "Pristine" profile 0000); Setup
+   clones it to 0001+. Rule `fix_hwprofile`: rebuild IDConfigDB from the profiles still
+   under `<CS>\Hardware Profiles`.
+4. Then **0x69 IO1_INITIALIZATION_FAILED** (kernel I/O init):
+   - Rule `fix_devices`: the driver key `Control\Class\{guid}\NNNN` is rebuilt from the
+     device's own driver properties `Enum\…\Properties\{a8b865dd-…}` (DriverDesc, Version,
+     Date, InfPath, InfSection, MatchingDeviceId, Provider) — byte-identical to the lost
+     key. `CONFIGFLAG_REINSTALL` only for keys that can't be rebuilt or the Net class, and
+     **never for boot/system-start drivers** (flagging AHCI/disk/volume → no boot device).
+   - Still 0x69: bisecting `Control` subtrees → `DeviceClasses`. Keys **undeleted** from
+     free cells there break it (with the machine's partial `DeviceClasses` and no undelete
+     it boots). Pruning interface keys without `#` subkey wasn't it (the healthy hive has
+     7 such keys).
+5. **Clean device start** (`proto/devreset.py`): `Enum`, `DeviceClasses`,
+   `DeviceContainers`, `Class\{guid}\NNNN` and the start type of every boot-start service
+   taken from the WIM. The WIM is generalized and boots on any hardware; Windows
+   re-detects all devices on first boot ("Getting devices ready"). **Boots.**
+
+Rules learned:
+- Never apply transaction-log entries across a sequence gap.
+- WIM keys that Setup *specializes* (IDConfigDB) must not be restored verbatim.
+- PnP device state is the most fragile part; undelete is unsafe there. Offer
+  **clean device start** as an option (and the automatic fallback when `Control\Class`
+  or `Enum` lost a lot).
