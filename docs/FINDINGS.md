@@ -174,3 +174,51 @@ Not restored (not in any WIM): SYSTEM DPAPI master keys, Task XMLs, AppLocker ca
 Also learned: `servicing\Sessions\Sessions.xml` is **WOF-compressed** (reparse tag
 `0x80000017`). ntfs-3g without the `system-compression` plugin shows it as a broken
 symlink → hash lists miss it. Need the plugin on Linux, or handle WOF on both backends.
+
+## 2026-11-12 — ✅ Registry blind test: boots again
+
+User deleted keys in SOFTWARE and SYSTEM (unknown which). Symptom: `0xEF
+CRITICAL_PROCESS_DIED` right after the boot spinner.
+
+### What it took (4 attempts)
+
+1. **WIM merge only** (add missing keys/values, `X:` → `C:` in names and data):
+   SOFTWARE +18 877 keys. Still 0xEF. Two bugs found:
+   - hivex writes values > 16 344 bytes as one plain cell; Windows needs a `db`
+     (big data) record and blanks the value → `proto/bigdata.py` converts them.
+   - normal-diff "state areas" were excluded completely, hiding the real damage.
+2. **Undelete from free cells** (`proto/hiveundelete.py`): deleted keys stay in the hive
+   until their cells are reused. 1 558 keys recovered from the broken hive itself
+   (incl. user `ProfileList` entry, `SecurityManager\CapAuthz`, `IFEO\LSASS.exe`).
+   Only 3 were Windows' own old deletions (harmless). Still 0xEF.
+3. **Diagnosis**: `DumpStack.log.tmp` in the volume root holds bugcheck code + params
+   even when no dump survives. Set a dedicated dump file via CrashControl. The crash
+   now happened *before* the dump stack initialised (no pagefile created) → very early
+   (smss/csrss stage). Counting keys showed SOFTWARE 46 000 keys short of healthy:
+   **`SideBySide\Winners` (34 151 keys) completely gone**, plus most of CBS, Appx store,
+   Capabilities — all inside "state areas" the diff skips.
+4. **Lost-state rule**: a state *database* (SideBySide, CBS, Appx store, Capabilities)
+   with > 50 % of the WIM's keys missing is restored from the WIM. CBS packages only if
+   their `.mum` is on disk (19 removed packages stayed removed). Consumed queues
+   (RunOnce, Print\PackagesToAdd, …) are never restored. Healthy baseline: nothing to do.
+   → **boots**.
+
+### Repair order (registry)
+
+1. replay transaction logs (`hivelog.py`)
+2. undelete intact keys from free cells (machine's own data, best source)
+3. restore lost state databases from WIM
+4. add remaining missing keys/values from WIM (`X:` → `C:`)
+5. convert big values to `db` records
+6. swap hive in, back up original, empty `.LOG1/.LOG2`
+
+### Sources, none of which needs a backup
+
+| Source | From |
+|---|---|
+| transaction logs | broken PC |
+| free cells | broken PC |
+| WIM | ISO of the same build |
+
+Result vs. healthy state (measured only, not used): 264 018 / 265 029 keys. The rest is
+runtime state (LogonUI notifications, DiagTrack, consent store) Windows recreates.
