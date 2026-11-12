@@ -1,4 +1,4 @@
-//! Small Win32 helpers: strings, files, hashing, registry, processes.
+//! Small Win32 helpers: strings, files, hashing, drives, ISO mounting, processes.
 
 use std::collections::HashMap;
 use std::ptr;
@@ -7,7 +7,6 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::*;
-use windows_sys::Win32::System::Registry::*;
 
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -162,116 +161,6 @@ pub fn last_error() -> String {
     std::io::Error::last_os_error().to_string()
 }
 
-// ---------------------------------------------------------------- registry
-
-/// An offline hive loaded below HKLM; unloaded on drop.
-pub struct Hive {
-    pub name: String,
-}
-
-impl Hive {
-    pub fn load(name: &str, file: &str) -> Result<Hive, String> {
-        let r = unsafe { RegLoadKeyW(HKEY_LOCAL_MACHINE, wide(name).as_ptr(), wide(file).as_ptr()) };
-        if r != 0 {
-            return Err(format!("RegLoadKey {file}: {}", std::io::Error::from_raw_os_error(r as i32)));
-        }
-        Ok(Hive { name: name.to_string() })
-    }
-    pub fn key(&self, sub: &str) -> Option<Key> {
-        Key::open(&format!("{}\\{}", self.name, sub))
-    }
-}
-
-impl Drop for Hive {
-    fn drop(&mut self) {
-        unsafe { RegUnLoadKeyW(HKEY_LOCAL_MACHINE, wide(&self.name).as_ptr()) };
-    }
-}
-
-pub struct Key(HKEY);
-
-impl Drop for Key {
-    fn drop(&mut self) {
-        unsafe { RegCloseKey(self.0) };
-    }
-}
-
-impl Key {
-    pub fn open(path: &str) -> Option<Key> {
-        let mut h = ptr::null_mut();
-        let r = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide(path).as_ptr(), 0, KEY_READ, &mut h) };
-        if r == 0 { Some(Key(h)) } else { None }
-    }
-
-    fn raw(&self, name: &str) -> Option<(u32, Vec<u8>)> {
-        let mut t = 0u32;
-        let mut n = 0u32;
-        let wn = wide(name);
-        unsafe {
-            if RegQueryValueExW(self.0, wn.as_ptr(), ptr::null(), &mut t, ptr::null_mut(), &mut n) != 0 {
-                return None;
-            }
-            let mut buf = vec![0u8; n as usize];
-            if RegQueryValueExW(self.0, wn.as_ptr(), ptr::null(), &mut t, buf.as_mut_ptr(), &mut n) != 0 {
-                return None;
-            }
-            buf.truncate(n as usize);
-            Some((t, buf))
-        }
-    }
-
-    pub fn string(&self, name: &str) -> Option<String> {
-        let (_, b) = self.raw(name)?;
-        let w: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        Some(from_wide_buf(&w))
-    }
-
-    pub fn dword(&self, name: &str) -> Option<u32> {
-        let (_, b) = self.raw(name)?;
-        Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?))
-    }
-
-    pub fn subkeys(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut buf = [0u16; 512];
-        for i in 0.. {
-            let mut n = buf.len() as u32;
-            let r = unsafe {
-                RegEnumKeyExW(self.0, i, buf.as_mut_ptr(), &mut n, ptr::null(), ptr::null_mut(),
-                              ptr::null_mut(), ptr::null_mut())
-            };
-            if r != 0 {
-                break;
-            }
-            out.push(String::from_utf16_lossy(&buf[..n as usize]));
-        }
-        out
-    }
-
-    pub fn value_names(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut buf = vec![0u16; 16384];
-        for i in 0.. {
-            let mut n = buf.len() as u32;
-            let r = unsafe {
-                RegEnumValueW(self.0, i, buf.as_mut_ptr(), &mut n, ptr::null(), ptr::null_mut(),
-                              ptr::null_mut(), ptr::null_mut())
-            };
-            if r != 0 {
-                break;
-            }
-            out.push(String::from_utf16_lossy(&buf[..n as usize]));
-        }
-        out
-    }
-
-    pub fn sub(&self, name: &str) -> Option<Key> {
-        let mut h = ptr::null_mut();
-        let r = unsafe { RegOpenKeyExW(self.0, wide(name).as_ptr(), 0, KEY_READ, &mut h) };
-        if r == 0 { Some(Key(h)) } else { None }
-    }
-}
-
 // ---------------------------------------------------------------- drives
 
 /// Drive roots like "C:\\", excluding the WinPE system drive.
@@ -311,4 +200,55 @@ pub fn run(cmd: &str, args: &[&str]) -> (i32, String) {
         }
         Err(e) => (-1, e.to_string()),
     }
+}
+
+// ---------------------------------------------------------------- ISO images
+
+/// Attach an .iso read-only (VirtDisk, loaded at runtime so the tool still starts on a WinPE
+/// without it) and return the drive root it gets, e.g. "E:\\".
+pub fn mount_iso(path: &str) -> Result<String, String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    #[repr(C)]
+    struct StorageType { device_id: u32, vendor_id: windows_sys::core::GUID }
+    type OpenFn = unsafe extern "system" fn(*const StorageType, *const u16, i32, i32, *const u8, *mut HANDLE) -> u32;
+    type AttachFn = unsafe extern "system" fn(HANDLE, *const u8, i32, u32, *const u32, *const u8) -> u32;
+
+    let before = unsafe { GetLogicalDrives() };
+    unsafe {
+        let lib = LoadLibraryW(wide("virtdisk.dll").as_ptr());
+        if lib.is_null() {
+            return Err("virtdisk.dll is not available in this WinPE".into());
+        }
+        let open = GetProcAddress(lib, b"OpenVirtualDisk\0".as_ptr()).ok_or("OpenVirtualDisk missing")?;
+        let attach = GetProcAddress(lib, b"AttachVirtualDisk\0".as_ptr()).ok_or("AttachVirtualDisk missing")?;
+        let open: OpenFn = std::mem::transmute(open);
+        let attach: AttachFn = std::mem::transmute(attach);
+        let st = StorageType {
+            device_id: 1, // VIRTUAL_STORAGE_TYPE_DEVICE_ISO
+            vendor_id: windows_sys::core::GUID::from_u128(0xec984aec_a0f9_47e9_901f_71415a66345b),
+        };
+        let mut h: HANDLE = ptr::null_mut();
+        let r = open(&st, wide(path).as_ptr(), 0x000d_0000 /* ACCESS_READ */, 0, ptr::null(), &mut h);
+        if r != 0 {
+            return Err(format!("OpenVirtualDisk: {}", std::io::Error::from_raw_os_error(r as i32)));
+        }
+        let params = [1u32, 0u32]; // ATTACH_VIRTUAL_DISK_VERSION_1
+        // READ_ONLY | PERMANENT_LIFETIME (stays attached after the handle is closed)
+        let r = attach(h, ptr::null(), 1 | 4, 0, params.as_ptr(), ptr::null());
+        CloseHandle(h);
+        if r != 0 {
+            return Err(format!("AttachVirtualDisk: {}", std::io::Error::from_raw_os_error(r as i32)));
+        }
+    }
+    // the mount manager assigns a letter shortly after
+    for _ in 0..50 {
+        let now = unsafe { GetLogicalDrives() };
+        let new = now & !before;
+        if new != 0 {
+            let i = new.trailing_zeros() as u8;
+            return Ok(format!("{}:\\", (b'A' + i) as char));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err("attached, but no drive letter appeared".into())
 }

@@ -3,7 +3,10 @@
 Repair a corrupted Windows install **in place** by rebasing it onto a clean WIM of the
 **exact same build**, without a reinstall and without losing users, apps, drivers or data.
 
-> **Status:** design phase. Nothing here is runnable yet. See [docs/DESIGN.md](docs/DESIGN.md).
+> **Status:** working prototype. The WinPE app (`app/`) repairs files and registry hives
+> offline and brought a blind-broken Windows 11 VM back several times (deleted System32,
+> deleted SOFTWARE/SYSTEM keys, torn hives). Not tested on real hardware yet.
+> Findings: [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## The problem
 
@@ -44,6 +47,34 @@ This tool rewrites system files and registry hives on purpose.
 - **Linux** (secondary): bootable live USB, `ntfs-3g` + `hivex`.
 
 Both share one core. See [docs/DESIGN.md](docs/DESIGN.md#architecture).
+
+## Build the WinPE ISO
+
+Needs Rust with the `x86_64-pc-windows-gnu` target, MinGW, `wimlib-imagex`, `7z`, `xorriso`.
+
+```sh
+tools/build-wimlib.sh                       # static wimlib for MinGW (once)
+(cd app && cargo build --release)           # app/target/x86_64-pc-windows-gnu/release/winrebase.exe
+tools/build-iso.sh Win11_25H2_German_x64.iso   # -> build/winrebase-pe.iso
+```
+
+The ISO boots WinPE (from that Windows ISO's `boot.wim`) straight into winrebase. It
+contains Microsoft files: build it yourself, don't redistribute it.
+
+## Using it
+
+1. Boot the PC from the winrebase ISO/USB. Have the matching Windows ISO or
+   `install.wim`/`.esd` on a disk/USB, or attached as second drive.
+2. **Search** finds Windows installations and images (also inside `.iso` files, which are
+   mounted read-only). **Browse** takes a `.wim`, `.esd` or `.iso`.
+3. **Analyze**: compares every file under `\Windows` with the image and checks all
+   registry hives (log replay, missing keys vs. the image's hives, device state).
+4. **Repair**: restores files, rewrites damaged hives (originals in
+   `\Windows\winrebase-backup\<time>\config`), checks boot files.
+
+**Clean device start** (checkbox, automatic when the device part of SYSTEM is damaged):
+device state comes from the image, Windows detects all hardware again on first boot
+("Getting devices ready"), like after a fresh install. Users, apps and drive letters stay.
 
 ## Docs
 

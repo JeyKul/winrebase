@@ -1,12 +1,12 @@
 #!/bin/sh
 # Build a bootable WinPE test ISO with winrebase.exe starting automatically.
 #
-#   tools/build-iso.sh <mounted Windows ISO dir> [output.iso]
+#   tools/build-iso.sh <Windows .iso file or mounted ISO dir> [output.iso]
 #
 # Uses WinPE (index 1 of sources/boot.wim) and the boot files from that ISO. The result
 # is for your own testing; it contains Microsoft files, don't redistribute it.
 set -eu
-SRC=${1:?usage: build-iso.sh <mounted Windows ISO dir> [output.iso]}
+SRC=${1:?usage: build-iso.sh <Windows .iso or mounted ISO dir> [output.iso]}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${2:-$ROOT/build/winrebase-pe.iso}
 EXE=$ROOT/app/target/x86_64-pc-windows-gnu/release/winrebase.exe
@@ -14,6 +14,15 @@ WORK=$ROOT/build/iso
 [ -f "$EXE" ] || { echo "build the exe first: (cd app && cargo build --release)"; exit 1; }
 
 rm -rf "$WORK" && mkdir -p "$WORK/sources"
+if [ -f "$SRC" ]; then
+  # .iso file: pull out the boot files and boot.wim, no mount needed. Windows ISOs keep
+  # their files in UDF only (the ISO 9660 tree just has a README), so 7-Zip, not xorriso.
+  X=$ROOT/build/isosrc
+  rm -rf "$X" && mkdir -p "$X"
+  7z x -y -o"$X" "$SRC" bootmgr bootmgr.efi 'boot/*' 'efi/*' sources/boot.wim >/dev/null
+  chmod -R u+w "$X"
+  SRC=$X
+fi
 for f in bootmgr bootmgr.efi boot efi; do cp -r "$SRC/$f" "$WORK/"; done
 chmod -R u+w "$WORK"
 
