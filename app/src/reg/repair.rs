@@ -243,7 +243,11 @@ impl<'a> Repair<'a> {
     // -- 2. undelete --------------------------------------------------------------
     /// Windows clears the security pointer of deleted keys, so the descriptor comes from
     /// the same key in the WIM, or else from the parent (what inheritance gives).
-    fn undelete(&mut self, vm: &mut Key, deleted: &HashMap<String, Deleted>) {
+    ///
+    /// Windows deletes keys itself all the time (feature flags, driver churn), so a deleted
+    /// key only comes back where the hive is actually damaged: the WIM has the key, its parent
+    /// was restored in this run, or its parent is a `gap` (lost a child the WIM has).
+    fn undelete(&mut self, vm: &mut Key, deleted: &HashMap<String, Deleted>, gaps: &HashSet<String>) {
         let mut order: Vec<&String> = deleted.keys().collect();
         order.sort_by_key(|k| (k.matches('\\').count(), (*k).clone()));
         for low in order {
@@ -254,7 +258,11 @@ impl<'a> Repair<'a> {
             let parts = split(&d.path);
             let Some((last, parent_parts)) = parts.split_last() else { continue };
             let wim_sd = self.wim.get(&self.wim_path(&d.path)).map(|k| k.sd.clone());
+            let parent_low = lower(&parent_parts.iter().map(|p| format!("\\{p}")).collect::<String>());
             let Some(parent) = vm.get_mut(&parent_parts.join("\\")) else { continue };
+            if wim_sd.is_none() && !parent.restored && !parent.from_wim && !gaps.contains(&parent_low) {
+                continue;
+            }
             if let Some(existing) = parent.subs.get_mut(&lower(last)) {
                 if existing.from_wim {
                     // created from the WIM in this run: the machine's own copy wins
@@ -363,7 +371,9 @@ impl<'a> Repair<'a> {
                     if is_state(&wc.name, None) {
                         continue;
                     }
-                    vm.subs.insert(low.clone(), Key::new_like(&wc.name, wc));
+                    let mut k = Key::new_like(&wc.name, wc);
+                    k.from_wim = true;
+                    vm.subs.insert(low.clone(), k);
                     self.rep.keys_from_wim += 1;
                     self.rep.add("key", &wc.name, "");
                 }
@@ -744,6 +754,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (yoe + era * 400 + (m <= 2) as i64, m, d)
 }
 
+/// Lowercase paths ("\\A\\B", root "") of keys that got a child from the WIM in a merge.
+fn wim_gaps(k: &Key, path: &str, out: &mut HashSet<String>) {
+    for sub in k.subs.values() {
+        if sub.from_wim {
+            out.insert(lower(path));
+        } else {
+            wim_gaps(sub, &format!("{path}\\{}", sub.name), out);
+        }
+    }
+}
+
 /// Repair `vm` (already log-replayed, `vm_bytes` = its file for free-cell recovery) against
 /// the same hive from the WIM. `logs` = the original .LOG1/.LOG2 (stale nk records).
 pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &Options) -> Report {
@@ -761,19 +782,21 @@ pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &O
     let fc = FreeCells::new(vm_bytes);
     // Windows deletes keys itself all the time; only bring deleted keys back when the hive
     // is damaged (keys the WIM has are missing), else a healthy hive would get changes.
-    let damaged = {
+    let gaps = {
         let mut probe = Repair { wim, opts, cs_map: r.cs_map.clone(), rep: Report::default() };
         let mut copy = vm.clone();
         probe.merge(&mut copy);
-        probe.rep.keys_from_wim > 0
+        let mut gaps = HashSet::new();
+        wim_gaps(&copy, "", &mut gaps);
+        gaps
     };
-    let deleted = if damaged { fc.deleted_keys() } else { HashMap::new() };
-    r.undelete(vm, &deleted);
+    let deleted = if gaps.is_empty() { HashMap::new() } else { fc.deleted_keys() };
+    r.undelete(vm, &deleted, &gaps);
     if !system {
         r.restore_lost_state(vm);
     }
     r.merge(vm);
-    r.undelete(vm, &deleted); // 2nd pass: parents that only came back from the WIM
+    r.undelete(vm, &deleted, &gaps); // 2nd pass: parents that only came back from the WIM
 
     if !system {
         fix_profiles(vm, &opts.profiles, &mut r.rep);
@@ -813,4 +836,52 @@ pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &O
         }
     }
     r.rep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str) -> Key {
+        Key { name: name.into(), sd: vec![1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], ..Default::default() }
+    }
+
+    fn deleted(path: &str) -> (String, Deleted) {
+        (lower(path), Deleted { path: path.into(), values: vec![], ts: 1, class: None, sd: None, flags: 0, access: 0, ts_bytes: [0; 8] })
+    }
+
+    #[test]
+    fn undelete_only_where_damaged() {
+        // WIM: Software\Lost, Features. Machine lost Software\Lost; Windows itself deleted
+        // Features\Flag (a feature override the WIM never had).
+        let mut wim = key("ROOT");
+        let mut sw = key("Software");
+        sw.subs.insert("lost".into(), key("Lost"));
+        wim.subs.insert("software".into(), sw);
+        wim.subs.insert("features".into(), key("Features"));
+        let mut vm = key("ROOT");
+        vm.subs.insert("software".into(), key("Software"));
+        vm.subs.insert("features".into(), key("Features"));
+
+        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![], exists: None, app_manifests: vec![] };
+        let mut r = Repair { wim: &wim, opts: &opts, cs_map: None, rep: Report::default() };
+        let mut copy = vm.clone();
+        r.merge(&mut copy);
+        let mut gaps = HashSet::new();
+        wim_gaps(&copy, "", &mut gaps);
+        assert_eq!(gaps, HashSet::from([r"\software".to_string()]));
+
+        let mut r = Repair { wim: &wim, opts: &opts, cs_map: None, rep: Report::default() };
+        let d: HashMap<String, Deleted> = [
+            deleted(r"\Software\Lost"),        // the WIM has it
+            deleted(r"\Software\Lost\Child"),  // parent restored in this run
+            deleted(r"\Software\MachineOnly"), // parent lost a WIM child
+            deleted(r"\Features\Flag"),        // Windows churn: stays deleted
+        ].into_iter().collect();
+        r.undelete(&mut vm, &d, &gaps);
+        assert_eq!(r.rep.undeleted, 3);
+        assert!(vm.get(r"Software\Lost\Child").is_some());
+        assert!(vm.get(r"Software\MachineOnly").is_some());
+        assert!(vm.get(r"Features\Flag").is_none());
+    }
 }
