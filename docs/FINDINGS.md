@@ -345,3 +345,41 @@ Rules learned:
 - PnP device state is the most fragile part; undelete is unsafe there. Offer
   **clean device start** as an option (and the automatic fallback when `Control\Class`
   or `Enum` lost a lot).
+
+### Test 5, part 2: after it boots — profile, apps, Start menu
+
+Booted, but logon gave a fresh profile; Start menu, Settings, CrossDevice ("Die Anwendung
+wurde nicht bereitgestellt") and Terminal ("Das System kann auf die Datei nicht zugreifen")
+failed. Diffed against the healthy `win11-2-clone` (same build; the tool gives it 0 actions)
+and read the event logs offline (python-evtx). Four more rules, all in `app/src/reg`:
+
+| Damage | Effect | Rule |
+|---|---|---|
+| `ProfileList\<SID>` deleted | Windows makes `admin.MINWINPC`, an empty profile | rebuild from the account SID found in each `Users\*\NTUSER.DAT` (most frequent user SID in its security descriptors); point back to the oldest folder if Windows already made a duplicate |
+| `ComputerName` from the WIM | name is the WIM placeholder `MINWINPC` | take `Tcpip\Parameters\Hostname` |
+| `Appx\AppxAllUserStore\<SID>\*` (46 of 92) | per-user app bookkeeping gone | rebuild from `InboxApplications` + `Applications` (exactly the user's list on a healthy install) when ≥ 10 % are missing and the package files exist |
+| `SecurityManager\CapAuthz\ApplicationsEx` (2 of 99 left) | no package token: AppModel-Runtime 206 `GetPackageToken` | rebuild from `ProgramData\…\AppRepository\<package>.xml` (see below) |
+
+**CapAuthz** holds one entry per main package: `PackageSid`, `CapSids`, `DeviceCapSids`,
+`CustomCapSids`, `AppPackageType`, `EnterpriseID`, `ApplicationFlags`. Everything is derived
+from names:
+
+- package SID `S-1-15-2-` + first 7 DWORDs of SHA-256(lowercase family name, UTF-16LE)
+- capability SID `S-1-15-3-<rid>` for the 12 well-known capabilities, else
+  `S-1-15-3-1024-` + 8 DWORDs of SHA-256(UPPERCASE name, UTF-16LE)
+- `CapSids` = declared `Capability`/`DeviceCapability` names (+ `cellularData`, `wifiData`
+  with internet access; never `unvirtualizedResources`) + the package's own `S-1-15-3-<hash>`
+- `DeviceCapSids` = `S-1-15-3-<GUID>` from `DeviceAccess\CapabilityMappings\<capability>`
+- blob = count + SIDs + the same number of zero bytes
+- Settings has `AppPackageType` 2
+
+Against the clone: 52/99 byte-exact, 23 same SIDs in another order, 24 missing some implicit
+grants (Bluetooth/web host). Re-registering with `Add-AppxPackage -Register` rebuilds these
+entries for Store apps but **not for system apps** — that's why Start/Settings stayed broken.
+With the rule: **Start menu works.**
+
+Tool notes from this round:
+- WinPE showed a black screen in the VM while its network link was up (app window appears,
+  then black). Disabling the link fixed it; cause not yet known.
+- Host TPM passthrough and the q35 watchdog (`itco`, action reset) were removed from the
+  test VM while hunting this; neither was the cause.

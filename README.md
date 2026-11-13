@@ -72,6 +72,12 @@ contains Microsoft files: build it yourself, don't redistribute it.
 4. **Repair**: restores files, rewrites damaged hives (originals in
    `\Windows\winrebase-backup\<time>\config`), checks boot files.
 
+What the registry stage repairs: torn hives (log replay, never across a sequence gap),
+deleted keys (recovered from free cells, else added from the image), lost servicing/AppX
+databases, the hardware profile, device driver keys, user profile entries, the computer
+name, per-user app registrations and app capability entries (CapAuthz). Details:
+[docs/FINDINGS.md](docs/FINDINGS.md).
+
 **Clean device start** (checkbox, automatic when the device part of SYSTEM is damaged):
 device state comes from the image, Windows detects all hardware again on first boot
 ("Getting devices ready"), like after a fresh install. Users, apps and drive letters stay.
