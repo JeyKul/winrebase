@@ -181,6 +181,8 @@ pub struct Options {
     pub device_reset: DeviceReset,
     /// user profile folders on the disk (SOFTWARE: ProfileList rule)
     pub profiles: Vec<Profile>,
+    /// registered package manifests (AppRepository\<full name>.xml): (full name, xml)
+    pub app_manifests: Vec<(String, String)>,
     /// does this path (as the installation sees it, "C:\…") exist on the disk?
     pub exists: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
@@ -200,6 +202,7 @@ pub struct Report {
     pub classes_from_logs: usize,
     pub profiles_fixed: usize,
     pub appx_entries: usize,
+    pub capauthz_entries: usize,
     pub computer_name: Option<String>,
 }
 
@@ -208,7 +211,7 @@ impl Report {
         self.undeleted + self.keys_from_wim + self.values_from_wim + self.lost_state.len()
             + self.hw_profile.is_some() as usize + self.driver_keys_rebuilt + self.devices_reinstall
             + self.device_reset as usize + self.classes_from_logs + self.profiles_fixed
-            + self.computer_name.is_some() as usize + self.appx_entries
+            + self.computer_name.is_some() as usize + self.appx_entries + self.capauthz_entries
     }
     fn add(&mut self, kind: &str, path: &str, detail: &str) {
         self.log.push((kind.into(), path.into(), detail.into()));
@@ -628,6 +631,37 @@ fn fix_appx_users(vm: &mut Key, opts: &Options, rep: &mut Report) {
     }
 }
 
+const CAPAUTHZ: &str = r"Microsoft\SecurityManager\CapAuthz\ApplicationsEx";
+
+/// Capability entries of packaged apps (see capauthz.rs). Only on clear damage.
+fn fix_capauthz(vm: &mut Key, opts: &Options, rep: &mut Report) {
+    let main: Vec<&(String, String)> = opts.app_manifests.iter()
+        .filter(|(n, _)| super::capauthz::is_main_package(n)).collect();
+    if main.is_empty() {
+        return;
+    }
+    let devmap = super::capauthz::device_map(vm);
+    if vm.get(CAPAUTHZ).is_none() {
+        let Some(parent) = vm.get_mut(r"Microsoft\SecurityManager\CapAuthz") else { return };
+        let k = Key::new_like("ApplicationsEx", parent);
+        parent.subs.insert("applicationsex".into(), k);
+    }
+    let ax = vm.get_mut(CAPAUTHZ).unwrap();
+    let missing: Vec<&&(String, String)> = main.iter().filter(|(n, _)| !ax.subs.contains_key(&lower(n))).collect();
+    if missing.len() < 5 || missing.len() * 10 < main.len() {
+        return;
+    }
+    for (name, xml) in missing {
+        let mut k = Key::new_like(name, ax);
+        for (n, t, d) in super::capauthz::entry(name, xml, &devmap) {
+            k.set_value(&n, t, d);
+        }
+        ax.subs.insert(lower(name), k);
+        rep.capauthz_entries += 1;
+        rep.add("app capabilities rebuilt", CAPAUTHZ, name);
+    }
+}
+
 /// ComputerName restored from the WIM is its placeholder; the real name survives as the
 /// TCP/IP host name.
 fn fix_computer_name(cs: &mut Key, wim_cs: Option<&Key>, rep: &mut Report) {
@@ -744,6 +778,7 @@ pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &O
     if !system {
         fix_profiles(vm, &opts.profiles, &mut r.rep);
         fix_appx_users(vm, opts, &mut r.rep);
+        fix_capauthz(vm, opts, &mut r.rep);
     }
     if let Some((vcs, wcs)) = r.cs_map.clone() {
         if let Some(cs) = vm.get_mut(&vcs) {
