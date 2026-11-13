@@ -37,5 +37,10 @@
 - [ ] Docs for technicians
 
 ## Later
+- [ ] "Patch registry" when restoring an older/other build: bring SOFTWARE/SYSTEM/COMPONENTS
+  servicing state (UBR, CBS packages, component ownership) in line with the files restored
+- [ ] Detect COMPONENTS ≠ SOFTWARE CBS rollup version (wrong WIM poured over, aborted
+  rollback) → full restore with `--replace` semantics, COMPONENTS from the WIM
+- [ ] Clear stuck CBS state (`ExecuteState`, `SessionsPending`) after an aborted rollback
 - [ ] Manifest-based registry check without a WIM (`WinSxS\Manifests`)
 - [ ] Extra sources for FODs / language packs / optional features
