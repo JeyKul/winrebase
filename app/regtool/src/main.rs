@@ -1,4 +1,5 @@
-//! regtool HIVE OUT [--wim WIM_HIVE] [--log FILE]... [--mums SHA1LIST] [--devreset auto|always|never]
+//! regtool HIVE OUT [REPORT] [--wim WIM_HIVE] [--log FILE]... [--mums SHA1LIST] [--devreset auto|always|never]
+//!         [--reset-servicing] [--vbs-off]
 //!
 //! Runs the WinPE app's registry repair on the host, for testing against copied hives.
 
@@ -13,6 +14,7 @@ fn main() {
     let mut profiles = Vec::new();
     let mut app_manifests = Vec::new();
     let mut exists: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>> = None;
+    let (mut reset_servicing, mut vbs_off) = (false, false);
     let mut pos = Vec::new();
     let mut i = 0;
     while i < a.len() {
@@ -57,13 +59,16 @@ fn main() {
                 i += 1;
                 reset = match a[i].as_str() { "always" => reg::DeviceReset::Always, "never" => reg::DeviceReset::Never, _ => reg::DeviceReset::Auto };
             }
+            "--reset-servicing" => reset_servicing = true,
+            "--vbs-off" => vbs_off = true,
             x => pos.push(x.to_string()),
         }
         i += 1;
     }
     let primary = std::fs::read(&pos[0]).expect("hive");
     let lr: Vec<&[u8]> = logs.iter().map(|l| l.as_slice()).collect();
-    let opts = reg::Options { drive: "C:".into(), installed_mums: mums, device_reset: reset, profiles, exists, app_manifests };
+    let opts = reg::Options { drive: "C:".into(), installed_mums: mums, device_reset: reset, profiles, exists, app_manifests,
+                              reset_servicing, vbs_off };
     let t = std::time::Instant::now();
     let o = reg::process(&primary, &lr, wim.as_deref(), &opts).expect("process");
     println!("replay: {}", o.replay.describe());
@@ -75,7 +80,7 @@ fn main() {
                  r.undeleted, r.keys_from_wim, r.values_from_wim, r.lost_state, r.hw_profile,
                  r.driver_keys_rebuilt, r.devices_reinstall, r.device_reset, r.classes_from_logs);
         println!("profiles fixed {}, computer name {:?}, appx entries {}", r.profiles_fixed, r.computer_name, r.appx_entries);
-        println!("capauthz entries {}", r.capauthz_entries);
+        println!("capauthz entries {}, servicing reset {}, vbs off {}", r.capauthz_entries, r.servicing_reset, r.vbs_off);
         if let Some(rep) = pos.get(2) {
             let s: String = r.log.iter().map(|(k, p, d)| format!("{k}\t{p}\t{d}\n")).collect();
             std::fs::write(rep, s).unwrap();

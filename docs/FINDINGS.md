@@ -383,3 +383,53 @@ Tool notes from this round:
   then black). Disabling the link fixed it; cause not yet known.
 - Host TPM passthrough and the q35 watchdog (`itco`, action reset) were removed from the
   test VM while hunting this; neither was the cause.
+
+## 2026-11-13 — Real case: Win11 Pro 26300.9550, 0xc0000001
+
+Customer PC, boot manager stops with **0xc0000001**; real hardware power-cycles once during
+boot. Disk imaged (qcow2, read-only base), tested on overlays in a VM without network.
+WIM: index with the exact build (26300.9550 Pro). Every step bisected on its own overlay.
+
+History, from `CBS.log` and the files:
+1. Cumulative update installed, reboot pending.
+2. PC started in **Safe Mode** with the update pending → `0x800f0923
+   CBS_E_SAFEMODE_ENTERED`, rollback started, then `Failed to query for a cmdline to use for
+   Poqexec` → rollback stopped halfway (`ExecuteState` 3, `CrossRebootHresult` 0x800f0923).
+3. A repair attempt copied **26200.6584 media** files over `\Windows`, including
+   `COMPONENTS` (file date 2025-09-15, seq 123; its own `.LOG1` still had seq 2506+ with the
+   real 9549/9711/9818 data).
+
+State found: SOFTWARE (UBR, CBS `RollupFix 26100.9550` installed) and the WinSxS payload at
+9550; System32 hardlinked to the 6584 components; COMPONENTS from 6584.
+
+Why the tool didn't fix it: COMPONENTS didn't know the 9549 components, so every differing
+System32 file was skipped as "component not installed (staged)".
+
+| Overlay | Change | Result |
+|---|---|---|
+| A | as found (after two tool runs) | 0xc0000001 |
+| B | 11 350 files back to the WIM (10 031 re-linked to intact 9549 twins, 2 233 extracted), COMPONENTS from the WIM, `ExecuteState` 0 | 0xc0000001 |
+| C | B + original SYSTEM | 0xc0000001 |
+| E | B + the WIM's SYSTEM | past winload (black screen, mismatched hives) |
+| F | C + 6 third-party boot drivers off (Kaspersky, Roxio) | 0xc0000001 |
+| G | F + `DeviceGuard\EnableVirtualizationBasedSecurity` 0 | **boots to the desktop** |
+
+`\Windows\bootstat.dat` (winload's log) showed the failing step: event 0xeb (0xc0000002)
+then 0xd0 (0xc0000001) after loading the CI policies — the hypervisor / secure kernel launch
+for VBS. That also explains the power cycle on real hardware.
+
+Not the cause: ESP and BCD (boot manager 28000.367 is what 26300.9550 ships; BCD clean),
+IDConfigDB, the third-party boot drivers.
+
+New in the tool:
+- **Stale COMPONENTS**: WIM component folders present on disk but unknown to COMPONENTS.
+  Healthy 0.04 %, this case 31 % → over 10 % = full restore mode, COMPONENTS from the WIM.
+- **Servicing reset**: after a full restore, `ExecuteState` → 0 when
+  `SessionsPending\CrossRebootHresult` is a failure (fresh images have `ExecuteState` 3
+  without a failure — left alone).
+- **Turn off VBS** option (VBS + HVCI `Enabled` → 0); Analyze hints at it when VBS is on.
+- `fullrestore.py --replace` for the prototype path.
+- Undelete only where the hive is damaged (two earlier tool runs undeleted 532 feature
+  override keys Windows had removed itself).
+
+Hive edits during the bisect were in-place DWORD patches (one byte each), never a rewrite.
