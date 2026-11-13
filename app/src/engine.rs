@@ -334,6 +334,17 @@ pub struct RegItem {
     pub changes: bool,
 }
 
+/// Registered package manifests (ProgramData\\Microsoft\\Windows\\AppRepository\\<full name>.xml).
+fn read_app_manifests(root: &str) -> Vec<(String, String)> {
+    let Ok(rd) = std::fs::read_dir(format!("{root}ProgramData\\Microsoft\\Windows\\AppRepository")) else { return Vec::new() };
+    rd.flatten().filter_map(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        let stem = n.strip_suffix(".xml")?.to_string();
+        let b = std::fs::read(e.path()).ok()?;
+        Some((stem, String::from_utf8_lossy(&b).to_string()))
+    }).collect()
+}
+
 /// Profile folders with a user hive, and the account each belongs to.
 fn find_profiles(root: &str, drive: &str, out: &mut Out) -> Vec<reg::Profile> {
     let mut v = Vec::new();
@@ -389,7 +400,9 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
             _ => true,
         }
     });
+    let app_manifests = read_app_manifests(root);
     let opts = reg::Options {
+        app_manifests,
         exists: Some(exists),
         profiles,
         drive,
@@ -439,6 +452,7 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
             if r.device_reset { item.summary.push("clean device start: Windows detects all hardware again".into()); }
             if r.classes_from_logs > 0 { item.summary.push(format!("{} class names recovered (Lsa boot key)", r.classes_from_logs)); }
             if r.appx_entries > 0 { item.summary.push(format!("{} per-user app registrations rebuilt", r.appx_entries)); }
+            if r.capauthz_entries > 0 { item.summary.push(format!("{} app capability entries rebuilt", r.capauthz_entries)); }
             if r.profiles_fixed > 0 { item.summary.push(format!("{} user profile entries repaired", r.profiles_fixed)); }
             if let Some(n) = &r.computer_name { item.summary.push(format!("computer name restored: {n}")); }
         }
