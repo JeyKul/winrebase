@@ -115,7 +115,7 @@ fn start_search() {
     set_busy(true);
     append_log("Searching for Windows installations and WIM/ESD files…");
     let main = UI.with(|u| u.borrow().main);
-    std::thread::spawn(move || {
+    worker(move || {
         let mut out = Out::new(sink(main));
         let installs = engine::find_installs();
         let sources = engine::find_sources(&mut out);
@@ -432,7 +432,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+/// Never vanish silently: report panics (any thread) in a message box and a file on X:.
+fn crash_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("winrebase crashed:\n\n{info}\n\n{}", std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::write(format!("{}winrebase-crash.txt", win::system_drive()), &msg);
+        unsafe {
+            MessageBoxW(null_mut(), wide(&msg.chars().take(1500).collect::<String>()).as_ptr(),
+                        wide("winrebase").as_ptr(), MB_ICONERROR);
+        }
+    }));
+}
+
 fn main() {
+    crash_hook();
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,

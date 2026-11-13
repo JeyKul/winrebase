@@ -11,6 +11,7 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let (mut wim, mut logs, mut mums, mut reset) = (None, Vec::new(), None, reg::DeviceReset::Auto);
     let mut profiles = Vec::new();
+    let mut app_manifests = Vec::new();
     let mut exists: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>> = None;
     let mut pos = Vec::new();
     let mut i = 0;
@@ -43,6 +44,15 @@ fn main() {
                     .map(|l| l.trim_start_matches('/').replace('/', "\\").to_lowercase()).collect();
                 exists = Some(std::sync::Arc::new(move |p: &str| set.contains(&p.get(3..).unwrap_or("").to_lowercase())));
             }
+            "--apprepo" => {
+                i += 1;
+                for e in std::fs::read_dir(&a[i]).expect("apprepo").flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if let Some(stem) = n.strip_suffix(".xml") {
+                        app_manifests.push((stem.to_string(), String::from_utf8_lossy(&std::fs::read(e.path()).unwrap()).to_string()));
+                    }
+                }
+            }
             "--devreset" => {
                 i += 1;
                 reset = match a[i].as_str() { "always" => reg::DeviceReset::Always, "never" => reg::DeviceReset::Never, _ => reg::DeviceReset::Auto };
@@ -53,7 +63,7 @@ fn main() {
     }
     let primary = std::fs::read(&pos[0]).expect("hive");
     let lr: Vec<&[u8]> = logs.iter().map(|l| l.as_slice()).collect();
-    let opts = reg::Options { drive: "C:".into(), installed_mums: mums, device_reset: reset, profiles, exists };
+    let opts = reg::Options { drive: "C:".into(), installed_mums: mums, device_reset: reset, profiles, exists, app_manifests };
     let t = std::time::Instant::now();
     let o = reg::process(&primary, &lr, wim.as_deref(), &opts).expect("process");
     println!("replay: {}", o.replay.describe());
@@ -65,6 +75,7 @@ fn main() {
                  r.undeleted, r.keys_from_wim, r.values_from_wim, r.lost_state, r.hw_profile,
                  r.driver_keys_rebuilt, r.devices_reinstall, r.device_reset, r.classes_from_logs);
         println!("profiles fixed {}, computer name {:?}, appx entries {}", r.profiles_fixed, r.computer_name, r.appx_entries);
+        println!("capauthz entries {}", r.capauthz_entries);
         if let Some(rep) = pos.get(2) {
             let s: String = r.log.iter().map(|(k, p, d)| format!("{k}\t{p}\t{d}\n")).collect();
             std::fs::write(rep, s).unwrap();
