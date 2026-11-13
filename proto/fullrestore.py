@@ -39,6 +39,9 @@ def main():
     ap.add_argument("software")
     ap.add_argument("extra", nargs="*", help="extra WIM paths under /Windows to restore "
                     "even if excluded (e.g. missing hives)")
+    ap.add_argument("--replace", action="store_true",
+                    help="also replace files whose content differs from the WIM (another "
+                    "build was poured over \\Windows)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -55,9 +58,11 @@ def main():
         if e["link"] and not e["attrs"] & ATTR_DIRECTORY:
             groups[e["link"]].append(k)
 
-    restore, links, skipped = [], [], collections.Counter()
+    restore, links, replaced, skipped = [], [], [], collections.Counter()
     for k, e in sorted(wim.items()):
-        if e["attrs"] & ATTR_DIRECTORY or k in vm_paths:
+        if e["attrs"] & ATTR_DIRECTORY:
+            continue
+        if k in vm_paths and not (a.replace and k in vm and vm[k][1] != e["hash"]):
             continue
         if excluded(k) and k not in extra:
             skipped["excluded"] += 1
@@ -73,6 +78,8 @@ def main():
                 os.path.splitext(parts[2])[0] not in pkgs:
             skipped["CBS package not installed"] += 1
             continue
+        if k in vm_paths:
+            replaced.append(vm_paths[k])
         twin = [s for s in groups.get(e["link"], []) if s != k and s in vm
                 and vm[s][1] == e["hash"]]
         if twin:
@@ -91,6 +98,7 @@ def main():
         if e["attrs"] & ATTR_DIRECTORY and k in vm_paths and vm_paths[k] != e["rel"]:
             casemap[e["rel"]] = vm_paths[k]
 
+    print(f"replace (content differs): {len(replaced)}")
     print(f"extract: {len(restore)}  relink to surviving twin: {len(links)}  "
           f"new dirs: {len(missing_dirs)}  case fixes: {len(casemap)}")
     for r, n in skipped.most_common():
@@ -118,11 +126,14 @@ def main():
         return f"setfattr -h -n system.ntfs_acl -v 0x{sd} {shlex.quote(root + real(rel))}"
 
     lines = ["fail=0"]
+    with open(a.out + ".replace.txt", "w") as f:
+        for r in replaced:
+            f.write(f"/Windows/{r}\n")
     for d in missing_dirs:
         lines.append(f"mkdir -p {shlex.quote(root + real(d))} && {setsd(d)} || fail=$((fail+1))")
     for src, dst in links:
-        lines.append(f"[ -e {shlex.quote(root + real(dst))} ] || ln {shlex.quote(root + src)} "
-                     f"{shlex.quote(root + real(dst))} || fail=$((fail+1))")
+        lines.append(f"ln -f {shlex.quote(root + src)} {shlex.quote(root + real(dst))} "
+                     f"|| fail=$((fail+1))")
     seen_groups = set()
     for r in restore:
         g = wim[r.lower()]["link"]
