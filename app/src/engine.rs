@@ -293,6 +293,8 @@ pub struct Plan {
     /// hives that will be rewritten
     pub reg_changes: Vec<String>,
     pub device_reset: bool,
+    /// turn off VBS/HVCI in the SYSTEM hive (boot error 0xc0000001)
+    pub vbs_off: bool,
 }
 
 impl Plan {
@@ -384,6 +386,14 @@ pub struct RegItem {
     pub changes: bool,
 }
 
+/// VBS switched on in the SYSTEM hive's current control set.
+fn vbs_enabled(root: &str) -> bool {
+    let sys = format!("{root}Windows\\System32\\config\\SYSTEM");
+    let Some(cur) = read_key(&sys, "Select").and_then(|k| k.dword("Current")) else { return false };
+    read_key(&sys, &format!(r"ControlSet{cur:03}\Control\DeviceGuard"))
+        .and_then(|k| k.dword("EnableVirtualizationBasedSecurity")).unwrap_or(0) != 0
+}
+
 /// Registered package manifests (ProgramData\\Microsoft\\Windows\\AppRepository\\<full name>.xml).
 fn read_app_manifests(root: &str) -> Vec<(String, String)> {
     let Ok(rd) = std::fs::read_dir(format!("{root}ProgramData\\Microsoft\\Windows\\AppRepository")) else { return Vec::new() };
@@ -423,9 +433,20 @@ fn installed_mums(root: &str) -> Option<HashSet<String>> {
     }).collect())
 }
 
+/// What the registry stage may do besides the normal rules.
+#[derive(Clone, Copy, Default)]
+pub struct RegMode {
+    pub unmatched: bool,
+    pub device_reset: bool,
+    /// every Windows file is restored: pending servicing operations are void
+    pub full_restore: bool,
+    pub vbs_off: bool,
+}
+
 /// Check (apply = false) or repair (apply = true) the registry hives of `root`.
-pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_reset: bool, apply: bool,
+pub fn registry(root: &str, wim_path: &str, image: i32, mode: RegMode, apply: bool,
                 out: &mut Out) -> Result<Vec<RegItem>, String> {
+    let RegMode { unmatched, device_reset, .. } = mode;
     let cfg = format!("{root}Windows\\System32\\config\\");
     let work = format!("{}winrebase\\wim\\", win::system_drive());
     if !unmatched {
@@ -458,6 +479,8 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
         drive,
         installed_mums: installed_mums(root),
         device_reset: if device_reset { reg::DeviceReset::Always } else { reg::DeviceReset::Auto },
+        reset_servicing: mode.full_restore,
+        vbs_off: mode.vbs_off,
     };
     let backup = format!("{root}Windows\\winrebase-backup\\{}\\config\\", stamp());
     let all: Vec<(&str, bool)> = WIM_HIVES.iter().map(|h| (*h, !unmatched))
@@ -505,6 +528,8 @@ pub fn registry(root: &str, wim_path: &str, image: i32, unmatched: bool, device_
             if r.capauthz_entries > 0 { item.summary.push(format!("{} app capability entries rebuilt", r.capauthz_entries)); }
             if r.profiles_fixed > 0 { item.summary.push(format!("{} user profile entries repaired", r.profiles_fixed)); }
             if let Some(n) = &r.computer_name { item.summary.push(format!("computer name restored: {n}")); }
+            if r.servicing_reset { item.summary.push("unfinished update operations cancelled (files were restored)".into()); }
+            if r.vbs_off { item.summary.push("virtualization-based security turned off".into()); }
         }
         item.changes = o.output.is_some();
         if apply {
@@ -561,7 +586,8 @@ fn stamp() -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
-pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, out: &mut Out) -> Result<Plan, String> {
+pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, vbs_off: bool, out: &mut Out)
+               -> Result<Plan, String> {
     let t0 = Instant::now();
     out.progress(0.0, "Reading WIM…");
     out.log(format!("Source: {}", src.label(None)));
@@ -592,12 +618,29 @@ pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, ou
                 && e.path.matches('\\').count() == 2)
         .collect();
     let sxs_missing = sxs_dirs.iter().filter(|e| disk[&e.path.to_lowercase()].is_none()).count();
-    let full_mode = unmatched || ctx.owned.is_none()
+    // COMPONENTS from another build (files of other media copied over \Windows, aborted
+    // rollback): it doesn't know the WIM's components although their folders are there.
+    // Healthy: ~0 %, real case: 31 %.
+    let components_stale = ctx.comp_keys.as_ref().is_some_and(|keys| {
+        let present: Vec<String> = sxs_dirs.iter()
+            .filter(|e| disk[&e.path.to_lowercase()].is_some())
+            .map(|e| e.path.to_lowercase().rsplit('\\').next().unwrap_or("").to_string()).collect();
+        let unknown = present.iter().filter(|d| !keys.contains(*d)).count();
+        if present.len() > 100 && unknown * 10 > present.len() {
+            out.log(format!("  component database doesn't match the installation: {unknown} of {} component \
+                             folders unknown to it", present.len()));
+            true
+        } else {
+            false
+        }
+    });
+    let full_mode = unmatched || ctx.owned.is_none() || components_stale
         || (sxs_dirs.len() > 0 && sxs_missing * 2 > sxs_dirs.len());
     if full_mode {
         out.log(format!("Full restore mode ({}): every Windows file from the WIM is restored.",
                         if unmatched { "unmatched WIM allowed" }
                         else if ctx.owned.is_none() { "component store unreadable" }
+                        else if components_stale { "component database from another build" }
                         else { "more than half of WinSxS is gone" }));
     }
 
@@ -643,8 +686,8 @@ pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, ou
         // decide whether this difference is damage
         if excluded(&wrel) {
             let hive_gone = on_disk.is_none() && RESTORABLE_HIVES.contains(&wrel.as_str());
-            // unmatched: WinSxS comes from the WIM, so its component database must too
-            let components = unmatched && wrel == "system32\\config\\components";
+            // WinSxS comes from the WIM, so its component database must too
+            let components = (unmatched || components_stale) && wrel == "system32\\config\\components";
             if !(hive_gone || components) {
                 *skipped.entry("live state (excluded)").or_default() += 1;
                 continue;
@@ -692,7 +735,7 @@ pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, ou
 
     // turn needed files into actions
     let mut plan = Plan { root: root.to_string(), image: src.image.index, wim_path: src.path.clone(),
-                          full_mode, unmatched, ..Default::default() };
+                          full_mode, unmatched, vbs_off, ..Default::default() };
     for e in &need {
         let rel = e.path.to_lowercase();
         if disk[&rel].is_some() {
@@ -772,8 +815,13 @@ pub fn analyze(root: &str, src: &Source, unmatched: bool, device_reset: bool, ou
     }
     drop(wim);
 
+    if !vbs_off && vbs_enabled(root) {
+        out.log("  virtualization-based security (VBS) is on. If Windows stops with 0xc0000001 after the \
+                 repair, tick \"Turn off VBS\" and repair again.");
+    }
     out.log("Checking the registry…");
-    let items = registry(root, &src.path, src.image.index, unmatched, device_reset, false, out)?;
+    let mode = RegMode { unmatched, device_reset, full_restore: full_mode, vbs_off };
+    let items = registry(root, &src.path, src.image.index, mode, false, out)?;
     log_registry(&items, out);
     plan.reg_changes = items.iter().filter(|i| i.changes).map(|i| i.hive.clone()).collect();
     plan.device_reset = device_reset;
@@ -828,7 +876,9 @@ pub fn repair(plan: &Plan, out: &mut Out) -> Result<(), String> {
     }
     if !plan.reg_changes.is_empty() {
         out.log("Repairing the registry…");
-        match registry(root, &plan.wim_path, plan.image, plan.unmatched, plan.device_reset, true, out) {
+        let mode = RegMode { unmatched: plan.unmatched, device_reset: plan.device_reset,
+                             full_restore: plan.full_mode, vbs_off: plan.vbs_off };
+        match registry(root, &plan.wim_path, plan.image, mode, true, out) {
             Ok(items) => log_registry(&items, out),
             Err(e) => {
                 errors += 1;

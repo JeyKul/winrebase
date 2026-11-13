@@ -185,6 +185,10 @@ pub struct Options {
     pub app_manifests: Vec<(String, String)>,
     /// does this path (as the installation sees it, "C:\…") exist on the disk?
     pub exists: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// all Windows files were restored: cancel unfinished servicing (SOFTWARE)
+    pub reset_servicing: bool,
+    /// turn off VBS/HVCI (SYSTEM)
+    pub vbs_off: bool,
 }
 
 #[derive(Default, Debug)]
@@ -204,6 +208,8 @@ pub struct Report {
     pub appx_entries: usize,
     pub capauthz_entries: usize,
     pub computer_name: Option<String>,
+    pub servicing_reset: bool,
+    pub vbs_off: bool,
 }
 
 impl Report {
@@ -212,6 +218,7 @@ impl Report {
             + self.hw_profile.is_some() as usize + self.driver_keys_rebuilt + self.devices_reinstall
             + self.device_reset as usize + self.classes_from_logs + self.profiles_fixed
             + self.computer_name.is_some() as usize + self.appx_entries + self.capauthz_entries
+            + self.servicing_reset as usize + self.vbs_off as usize
     }
     fn add(&mut self, kind: &str, path: &str, detail: &str) {
         self.log.push((kind.into(), path.into(), detail.into()));
@@ -754,6 +761,43 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (yoe + era * 400 + (m <= 2) as i64, m, d)
 }
 
+/// After a full file restore, a servicing transaction that failed across a reboot (e.g.
+/// 0x800f0923 "Safe mode entered while needing to process the advanced operation queue",
+/// rollback left half done) refers to files that are gone: cancel it so CBS doesn't resume
+/// it. ExecuteState alone isn't a sign: fresh images carry 3 for their first-boot work.
+fn reset_servicing(sw: &mut Key, rep: &mut Report) {
+    let Some(cbs) = sw.get_mut(r"Microsoft\Windows\CurrentVersion\Component Based Servicing") else { return };
+    let failed = cbs.get("SessionsPending").and_then(|k| k.dword("CrossRebootHresult"))
+        .is_some_and(|hr| hr & 0x8000_0000 != 0);
+    let state = cbs.dword("ExecuteState").unwrap_or(0);
+    if failed && state != 0 {
+        cbs.set_value("ExecuteState", 4, 0u32.to_le_bytes().to_vec());
+        rep.servicing_reset = true;
+        rep.add("servicing reset", "Component Based Servicing\\ExecuteState", &format!("{state} -> 0"));
+    }
+}
+
+/// VBS makes winload start the hypervisor and secure kernel; when that fails the boot stops
+/// with 0xc0000001 (and real PCs power-cycle first). Off here; Windows Security can turn it
+/// on again. A UEFI-locked VBS can't be undone from the registry.
+fn vbs_off(cs: &mut Key, rep: &mut Report) {
+    let zero = || 0u32.to_le_bytes().to_vec();
+    if let Some(dg) = cs.get_mut(r"Control\DeviceGuard") {
+        if dg.dword("EnableVirtualizationBasedSecurity").unwrap_or(0) != 0 {
+            dg.set_value("EnableVirtualizationBasedSecurity", 4, zero());
+            rep.vbs_off = true;
+            rep.add("vbs off", r"Control\DeviceGuard", "EnableVirtualizationBasedSecurity 0");
+        }
+        if let Some(h) = dg.get_mut(r"Scenarios\HypervisorEnforcedCodeIntegrity") {
+            if h.dword("Enabled").unwrap_or(0) != 0 {
+                h.set_value("Enabled", 4, zero());
+                rep.vbs_off = true;
+                rep.add("vbs off", r"Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "Enabled 0");
+            }
+        }
+    }
+}
+
 /// Lowercase paths ("\\A\\B", root "") of keys that got a child from the WIM in a merge.
 fn wim_gaps(k: &Key, path: &str, out: &mut HashSet<String>) {
     for sub in k.subs.values() {
@@ -802,10 +846,16 @@ pub fn repair(vm: &mut Key, vm_bytes: &[u8], logs: &[&[u8]], wim: &Key, opts: &O
         fix_profiles(vm, &opts.profiles, &mut r.rep);
         fix_appx_users(vm, opts, &mut r.rep);
         fix_capauthz(vm, opts, &mut r.rep);
+        if opts.reset_servicing {
+            reset_servicing(vm, &mut r.rep);
+        }
     }
     if let Some((vcs, wcs)) = r.cs_map.clone() {
         if let Some(cs) = vm.get_mut(&vcs) {
             fix_computer_name(cs, wim.get(&wcs), &mut r.rep);
+            if opts.vbs_off {
+                vbs_off(cs, &mut r.rep);
+            }
             r.fix_hwprofile(cs);
             let damaged = Repair::devices_without_driver_key(cs).len();
             let reset = match opts.device_reset {
@@ -863,7 +913,7 @@ mod tests {
         vm.subs.insert("software".into(), key("Software"));
         vm.subs.insert("features".into(), key("Features"));
 
-        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![], exists: None, app_manifests: vec![] };
+        let opts = Options { drive: "C:".into(), installed_mums: None, device_reset: DeviceReset::Auto, profiles: vec![], exists: None, app_manifests: vec![], reset_servicing: false, vbs_off: false };
         let mut r = Repair { wim: &wim, opts: &opts, cs_map: None, rep: Report::default() };
         let mut copy = vm.clone();
         r.merge(&mut copy);
@@ -883,5 +933,55 @@ mod tests {
         assert!(vm.get(r"Software\Lost\Child").is_some());
         assert!(vm.get(r"Software\MachineOnly").is_some());
         assert!(vm.get(r"Features\Flag").is_none());
+    }
+
+    fn dword_key(name: &str, vals: &[(&str, u32)]) -> Key {
+        let mut k = key(name);
+        for (n, v) in vals {
+            k.set_value(n, 4, v.to_le_bytes().to_vec());
+        }
+        k
+    }
+
+    #[test]
+    fn servicing_reset_only_after_failed_transaction() {
+        // fresh image: ExecuteState 3, no failure -> untouched
+        let mut sw = key("ROOT");
+        let mut cbs = dword_key("Component Based Servicing", &[("ExecuteState", 3)]);
+        cbs.subs.insert("sessionspending".into(), key("SessionsPending"));
+        sw.subs.insert("microsoft".into(), key("Microsoft"));
+        let path = r"Microsoft\Windows\CurrentVersion";
+        for p in ["Windows", "CurrentVersion"] {
+            let parent = sw.get_mut(&path[..path.find(p).unwrap() - 1]).unwrap();
+            parent.subs.insert(p.to_lowercase(), key(p));
+        }
+        sw.get_mut(path).unwrap().subs.insert("component based servicing".into(), cbs);
+        let mut rep = Report::default();
+        reset_servicing(&mut sw, &mut rep);
+        assert!(!rep.servicing_reset);
+        // 0x800f0923 across the reboot -> cancelled
+        let cbs = sw.get_mut(&format!(r"{path}\Component Based Servicing")).unwrap();
+        cbs.get_mut("SessionsPending").unwrap().set_value("CrossRebootHresult", 4, 0x800f0923u32.to_le_bytes().to_vec());
+        reset_servicing(&mut sw, &mut rep);
+        assert!(rep.servicing_reset);
+        assert_eq!(sw.get(&format!(r"{path}\Component Based Servicing")).unwrap().dword("ExecuteState"), Some(0));
+    }
+
+    #[test]
+    fn vbs_off_clears_vbs_and_hvci() {
+        let mut cs = key("ControlSet001");
+        let mut ctl = key("Control");
+        let mut dg = dword_key("DeviceGuard", &[("EnableVirtualizationBasedSecurity", 1)]);
+        let mut sc = key("Scenarios");
+        sc.subs.insert("hypervisorenforcedcodeintegrity".into(), dword_key("HypervisorEnforcedCodeIntegrity", &[("Enabled", 1)]));
+        dg.subs.insert("scenarios".into(), sc);
+        ctl.subs.insert("deviceguard".into(), dg);
+        cs.subs.insert("control".into(), ctl);
+        let mut rep = Report::default();
+        vbs_off(&mut cs, &mut rep);
+        assert!(rep.vbs_off);
+        let dg = cs.get(r"Control\DeviceGuard").unwrap();
+        assert_eq!(dg.dword("EnableVirtualizationBasedSecurity"), Some(0));
+        assert_eq!(dg.get(r"Scenarios\HypervisorEnforcedCodeIntegrity").unwrap().dword("Enabled"), Some(0));
     }
 }

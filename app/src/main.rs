@@ -31,6 +31,7 @@ const ID_LOG: i32 = 108;
 const ID_PROGRESS: i32 = 109;
 const ID_STATUS: i32 = 110;
 const ID_DEVRESET: i32 = 111;
+const ID_VBSOFF: i32 = 112;
 
 const WM_ENGINE: u32 = WM_APP + 1;
 const WM_SEARCHED: u32 = WM_APP + 2;
@@ -83,7 +84,7 @@ fn set_status(frac: f64, text: &str) {
 
 fn set_busy(busy: bool) {
     UI.with(|u| u.borrow_mut().busy = busy);
-    for id in [ID_INSTALL, ID_WIM, ID_BROWSE, ID_SEARCH, ID_UNMATCHED, ID_DEVRESET, ID_ANALYZE] {
+    for id in [ID_INSTALL, ID_WIM, ID_BROWSE, ID_SEARCH, ID_UNMATCHED, ID_DEVRESET, ID_VBSOFF, ID_ANALYZE] {
         unsafe { EnableWindow(h(id), (!busy) as i32) };
     }
     let can_repair = !busy && UI.with(|u| u.borrow().plan.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
@@ -217,6 +218,7 @@ fn selection() -> Option<(Install, Source, bool)> {
 fn start_analyze() {
     let Some((inst, src, unmatched)) = selection() else { return };
     let device_reset = checked(ID_DEVRESET);
+    let vbs_off = checked(ID_VBSOFF);
     UI.with(|u| u.borrow_mut().plan = None);
     set_busy(true);
     append_log("");
@@ -224,7 +226,7 @@ fn start_analyze() {
     let main = UI.with(|u| u.borrow().main);
     worker(move || {
         let mut out = Out::new(sink(main));
-        let r = src.open().and_then(|src| engine::analyze(&inst.root, &src, unmatched, device_reset, &mut out));
+        let r = src.open().and_then(|src| engine::analyze(&inst.root, &src, unmatched, device_reset, vbs_off, &mut out));
         if let Err(e) = &r {
             out.log(format!("Analysis failed: {e}"));
         }
@@ -236,11 +238,12 @@ fn start_repair() {
     let Some(plan) = UI.with(|u| u.borrow_mut().plan.take()) else { return };
     let msg = format!(
         "Repair {} now?\n\n{} files restored from the image, {} re-linked, {} folders created, \
-         {} damaged files replaced.\nRegistry hives repaired: {}.{}{}\n\nThe originals of changed hives are kept in \
+         {} damaged files replaced.\nRegistry hives repaired: {}.{}{}{}\n\nThe originals of changed hives are kept in \
          \\Windows\\winrebase-backup. Make sure you have a backup if the data matters.",
         &plan.root[..2], plan.extract.len(), plan.links.len(), plan.mkdirs.len(), plan.delete.len(),
         if plan.reg_changes.is_empty() { "none".to_string() } else { plan.reg_changes.join(", ") },
         if plan.device_reset { "\nClean device start: Windows detects all hardware again on the next boot." } else { "" },
+        if plan.vbs_off { "\nVirtualization-based security is turned off." } else { "" },
         if plan.unmatched { "\n\nUNMATCHED IMAGE: Windows files are replaced with the image's versions \
                               and the boot files are rebuilt." } else { "" });
     let r = unsafe {
@@ -295,6 +298,8 @@ fn create_controls(hwnd: HWND) {
        BS_AUTOCHECKBOX as u32 | WS_TABSTOP, 0, ID_UNMATCHED, font);
     mk("BUTTON", "Clean device start (Windows detects all hardware again — automatic when the device registry is damaged)",
        BS_AUTOCHECKBOX as u32 | WS_TABSTOP, 0, ID_DEVRESET, font);
+    mk("BUTTON", "Turn off VBS (when Windows stops with 0xc0000001 or the PC restarts right at boot)",
+       BS_AUTOCHECKBOX as u32 | WS_TABSTOP, 0, ID_VBSOFF, font);
     mk("BUTTON", "Analyze", BS_PUSHBUTTON as u32 | WS_TABSTOP, 0, ID_ANALYZE, font);
     mk("BUTTON", "Repair", BS_PUSHBUTTON as u32 | WS_TABSTOP, 0, ID_REPAIR, font);
     mk("EDIT", "", ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL,
@@ -328,6 +333,8 @@ fn layout(w: i32, hgt: i32) {
     place(ID_UNMATCHED, m, y, w - 2 * m, s(22));
     y += s(24);
     place(ID_DEVRESET, m, y, w - 2 * m, s(22));
+    y += s(24);
+    place(ID_VBSOFF, m, y, w - 2 * m, s(22));
     y += s(30);
     place(ID_ANALYZE, m, y, s(110), s(30));
     place(ID_REPAIR, m + s(120), y, s(110), s(30));
@@ -367,7 +374,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     fill_sources();
                     set_busy(false);
                 }
-                (ID_WIM, CBN_SELCHANGE) | (ID_UNMATCHED, _) => {
+                (ID_WIM, CBN_SELCHANGE) | (ID_UNMATCHED, _) | (ID_DEVRESET, _) | (ID_VBSOFF, _) => {
                     UI.with(|u| u.borrow_mut().plan = None);
                     set_busy(false);
                 }
