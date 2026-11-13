@@ -89,7 +89,10 @@ pub fn find_installs() -> Vec<Install> {
 
 #[derive(Clone, Debug)]
 pub struct Source {
+    /// WIM/ESD path; inside an .iso: relative to its root ("sources\\install.wim")
     pub path: String,
+    /// the .iso holding it; attached only while it is used (see `Source::open`)
+    pub iso: Option<String>,
     pub image: Image,
 }
 
@@ -104,8 +107,21 @@ impl Source {
             Some(_) => "  ✘ different build/edition",
             None => "",
         };
-        format!("{}  [{}] {}  {}.{}{}", self.path, self.image.index, self.image.name,
+        let path = match &self.iso {
+            Some(iso) => format!("{iso} › {}", self.path),
+            None => self.path.clone(),
+        };
+        format!("{path}  [{}] {}  {}.{}{}", self.image.index, self.image.name,
                 self.image.build, self.image.spbuild, m)
+    }
+
+    /// The source with a usable file path: attaches its .iso (detaching any other .iso this
+    /// tool attached, so drive letters don't run out).
+    pub fn open(&self) -> Result<Source, String> {
+        let Some(iso) = &self.iso else { return Ok(self.clone()) };
+        unmount_isos_except(iso);
+        let (d, _) = mount_iso(iso)?;
+        Ok(Source { path: format!("{d}{}", self.path), iso: None, image: self.image.clone() })
     }
 }
 
@@ -140,34 +156,49 @@ pub fn find_sources(out: &mut Out) -> Vec<Source> {
             }
         }
     }
-    for iso in isos {
-        match mount_iso(&iso) {
-            Ok((d, new)) => {
-                if new {
-                    out.log(format!("  mounted {iso} as {}", &d[..2]));
-                }
-                files.extend(images_on(&d));
-            }
-            Err(e) => out.log(format!("  can't mount {iso}: {e}")),
-        }
-    }
+    // our own attached ISOs would show up as drives: skip them, they are listed below
+    let ours: Vec<String> = MOUNTED.lock().unwrap().iter().map(|(_, d)| d.to_lowercase()).collect();
+    files.retain(|f| !ours.iter().any(|d| f.to_lowercase().starts_with(d)));
     files.sort();
     files.dedup();
     let mut out_v = Vec::new();
     for f in files {
-        match Wim::open(&f) {
-            Ok(w) => {
-                for image in w.images() {
-                    out_v.push(Source { path: f.clone(), image });
+        out_v.extend(sources_in(&f, None, out));
+    }
+    // ISOs one at a time: attach, read the image list, detach
+    for iso in isos {
+        let was_mounted = MOUNTED.lock().unwrap().iter().any(|(p, _)| p.eq_ignore_ascii_case(&iso));
+        match mount_iso(&iso) {
+            Ok((d, _)) => {
+                for f in images_on(&d) {
+                    let rel = f[d.len()..].to_string();
+                    out_v.extend(sources_in(&f, Some((&iso, &rel)), out));
+                }
+                if !was_mounted {
+                    unmount_iso(&iso);
                 }
             }
-            Err(e) => out.log(format!("  skipped {f}: {e}")),
+            Err(e) => out.log(format!("  can't mount {iso}: {e}")),
         }
     }
     out_v
 }
 
-/// Mounted .iso files (path -> drive root), so a second search doesn't attach them again.
+/// Images of one WIM/ESD. `iso` = (iso path, path inside it) when `f` is on an attached ISO.
+pub fn sources_in(f: &str, iso: Option<(&str, &str)>, out: &mut Out) -> Vec<Source> {
+    match Wim::open(f) {
+        Ok(w) => w.images().into_iter().map(|image| match iso {
+            Some((iso, rel)) => Source { path: rel.to_string(), iso: Some(iso.to_string()), image },
+            None => Source { path: f.to_string(), iso: None, image },
+        }).collect(),
+        Err(e) => {
+            out.log(format!("  skipped {f}: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+/// .iso files this tool attached (path -> drive root).
 static MOUNTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// Attach an .iso; returns (drive root, newly mounted).
@@ -179,6 +210,25 @@ pub fn mount_iso(path: &str) -> Result<(String, bool), String> {
     let d = win::mount_iso(path)?;
     m.push((path.to_string(), d.clone()));
     Ok((d, true))
+}
+
+/// Detach an .iso this tool attached.
+pub fn unmount_iso(path: &str) {
+    let mut m = MOUNTED.lock().unwrap();
+    if let Some(i) = m.iter().position(|(p, _)| p.eq_ignore_ascii_case(path)) {
+        if win::unmount_iso(path).is_ok() {
+            m.remove(i);
+        }
+    }
+}
+
+/// Detach every .iso this tool attached except `keep`.
+pub fn unmount_isos_except(keep: &str) {
+    let others: Vec<String> = MOUNTED.lock().unwrap().iter()
+        .filter(|(p, _)| !p.eq_ignore_ascii_case(keep)).map(|(p, _)| p.clone()).collect();
+    for p in others {
+        unmount_iso(&p);
+    }
 }
 
 /// install.wim/esd of a Windows ISO (or any *.wim/*.esd in its root and \sources).

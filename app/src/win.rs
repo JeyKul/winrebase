@@ -206,23 +206,19 @@ pub fn run(cmd: &str, args: &[&str]) -> (i32, String) {
 
 /// Attach an .iso read-only (VirtDisk, loaded at runtime so the tool still starts on a WinPE
 /// without it) and return the drive root it gets, e.g. "E:\\".
-pub fn mount_iso(path: &str) -> Result<String, String> {
+/// Open an .iso with VirtDisk (ACCESS_READ = attach read-only | detach | get info).
+fn open_iso(path: &str) -> Result<(HANDLE, windows_sys::Win32::Foundation::HMODULE), String> {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     #[repr(C)]
     struct StorageType { device_id: u32, vendor_id: windows_sys::core::GUID }
     type OpenFn = unsafe extern "system" fn(*const StorageType, *const u16, i32, i32, *const u8, *mut HANDLE) -> u32;
-    type AttachFn = unsafe extern "system" fn(HANDLE, *const u8, i32, u32, *const u32, *const u8) -> u32;
-
-    let before = unsafe { GetLogicalDrives() };
     unsafe {
         let lib = LoadLibraryW(wide("virtdisk.dll").as_ptr());
         if lib.is_null() {
             return Err("virtdisk.dll is not available in this WinPE".into());
         }
         let open = GetProcAddress(lib, b"OpenVirtualDisk\0".as_ptr()).ok_or("OpenVirtualDisk missing")?;
-        let attach = GetProcAddress(lib, b"AttachVirtualDisk\0".as_ptr()).ok_or("AttachVirtualDisk missing")?;
         let open: OpenFn = std::mem::transmute(open);
-        let attach: AttachFn = std::mem::transmute(attach);
         let st = StorageType {
             device_id: 1, // VIRTUAL_STORAGE_TYPE_DEVICE_ISO
             vendor_id: windows_sys::core::GUID::from_u128(0xec984aec_a0f9_47e9_901f_71415a66345b),
@@ -232,6 +228,22 @@ pub fn mount_iso(path: &str) -> Result<String, String> {
         if r != 0 {
             return Err(format!("OpenVirtualDisk: {}", std::io::Error::from_raw_os_error(r as i32)));
         }
+        Ok((h, lib))
+    }
+}
+
+pub fn mount_iso(path: &str) -> Result<String, String> {
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    type AttachFn = unsafe extern "system" fn(HANDLE, *const u8, i32, u32, *const u32, *const u8) -> u32;
+
+    let before = unsafe { GetLogicalDrives() };
+    unsafe {
+        let (h, lib) = open_iso(path)?;
+        let Some(attach) = GetProcAddress(lib, b"AttachVirtualDisk\0".as_ptr()) else {
+            CloseHandle(h);
+            return Err("AttachVirtualDisk missing".into());
+        };
+        let attach: AttachFn = std::mem::transmute(attach);
         let params = [1u32, 0u32]; // ATTACH_VIRTUAL_DISK_VERSION_1
         // READ_ONLY | PERMANENT_LIFETIME (stays attached after the handle is closed)
         let r = attach(h, ptr::null(), 1 | 4, 0, params.as_ptr(), ptr::null());
@@ -251,4 +263,24 @@ pub fn mount_iso(path: &str) -> Result<String, String> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     Err("attached, but no drive letter appeared".into())
+}
+
+/// Detach an .iso attached by `mount_iso` (frees its drive letter).
+pub fn unmount_iso(path: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    type DetachFn = unsafe extern "system" fn(HANDLE, u32, u32) -> u32;
+    unsafe {
+        let (h, lib) = open_iso(path)?;
+        let Some(detach) = GetProcAddress(lib, b"DetachVirtualDisk\0".as_ptr()) else {
+            CloseHandle(h);
+            return Err("DetachVirtualDisk missing".into());
+        };
+        let detach: DetachFn = std::mem::transmute(detach);
+        let r = detach(h, 0, 0);
+        CloseHandle(h);
+        if r != 0 {
+            return Err(format!("DetachVirtualDisk: {}", std::io::Error::from_raw_os_error(r as i32)));
+        }
+    }
+    Ok(())
 }

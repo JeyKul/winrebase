@@ -155,42 +155,45 @@ fn browse() {
         return;
     }
     let path = from_wide_buf(&buf);
-    if path.to_lowercase().ends_with(".iso") {
-        match engine::mount_iso(&path) {
-            Ok((d, _)) => {
-                append_log(&format!("Mounted {path} as {}", &d[..2]));
-                let imgs = engine::images_on(&d);
-                if imgs.is_empty() {
-                    append_log("  no install.wim/install.esd on it");
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut found = Vec::new();
+    {
+        let l2 = log.clone();
+        let mut out = Out::new(Box::new(move |ev: Ev| if let Ev::Log(l) = ev { l2.lock().unwrap().push(l) }));
+        if path.to_lowercase().ends_with(".iso") {
+            // read the image list, then detach again; attached when used
+            match engine::mount_iso(&path) {
+                Ok((d, new)) => {
+                    for f in engine::images_on(&d) {
+                        let rel = f[d.len()..].to_string();
+                        found.extend(engine::sources_in(&f, Some((&path, &rel)), &mut out));
+                    }
+                    if new {
+                        engine::unmount_iso(&path);
+                    }
                 }
-                for p in imgs {
-                    add_image(&p);
-                }
+                Err(e) => out.log(format!("Can't mount {path}: {e}")),
             }
-            Err(e) => append_log(&format!("Can't mount {path}: {e}")),
+        } else {
+            found = engine::sources_in(&path, None, &mut out);
         }
+    }
+    for l in log.lock().unwrap().iter() {
+        append_log(l);
+    }
+    if found.is_empty() {
+        append_log(&format!("No Windows images in {path}"));
         return;
     }
-    add_image(&path);
-}
-
-fn add_image(path: &str) {
-    let path = path.to_string();
-    match wim::Wim::open(&path) {
-        Ok(w) => {
-            let imgs = w.images();
-            append_log(&format!("Added {path} ({} images)", imgs.len()));
-            UI.with(|u| {
-                let mut u = u.borrow_mut();
-                u.sources.retain(|s| s.path != path);
-                for image in imgs {
-                    u.sources.insert(0, Source { path: path.clone(), image });
-                }
-            });
-            fill_sources();
+    append_log(&format!("Added {path} ({} images)", found.len()));
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.sources.retain(|s| !found.iter().any(|f| f.path == s.path && f.iso == s.iso));
+        for src in found.into_iter().rev() {
+            u.sources.insert(0, src);
         }
-        Err(e) => append_log(&format!("Can't open {path}: {e}")),
-    }
+    });
+    fill_sources();
 }
 
 fn selection() -> Option<(Install, Source, bool)> {
@@ -221,7 +224,7 @@ fn start_analyze() {
     let main = UI.with(|u| u.borrow().main);
     worker(move || {
         let mut out = Out::new(sink(main));
-        let r = engine::analyze(&inst.root, &src, unmatched, device_reset, &mut out);
+        let r = src.open().and_then(|src| engine::analyze(&inst.root, &src, unmatched, device_reset, &mut out));
         if let Err(e) = &r {
             out.log(format!("Analysis failed: {e}"));
         }
