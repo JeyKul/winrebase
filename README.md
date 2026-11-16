@@ -39,7 +39,7 @@ This tool rewrites system files and registry hives on purpose.
 - **The WIM must match the installed build exactly** (build + UBR, e.g. `26100.4652`). The
   tool reads the build from the offline hive and refuses a mismatched WIM. Matching ISOs
   can be built with [UUP dump](https://uupdump.net).
-- You use it at your own risk. See [LICENSE](LICENSE).
+- You use it at your own risk. See [LICENSE.md](LICENSE.md).
 
 ## Targets
 
@@ -91,4 +91,6 @@ device state comes from the image, Windows detects all hardware again on first b
 
 ## License
 
-GPL-3.0-or-later.
+[PolyForm Noncommercial 1.0.0](LICENSE.md). Free for noncommercial use. Commercial use needs a paid license — see [COMMERCIAL.md](COMMERCIAL.md).
+
+Versions released before this change remain available under GPL-3.0-or-later.
